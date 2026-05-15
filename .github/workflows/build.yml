@@ -53,8 +53,20 @@ jobs:
 
       - name: Install iPhoneOS 16.5 SDK
         run: |
+          # theos/sdks ships SDK tarballs as GitHub release assets (NOT raw
+          # files in the repo). Query API for the latest release and grab the
+          # iPhoneOS16.5 asset URL from there — keeps us automatically tracking
+          # new SDK drops without pinning a possibly-stale tag.
           cd ~/theos/sdks
-          curl -fsSL -O https://github.com/theos/sdks/raw/master/iPhoneOS16.5.sdk.tar.xz
+          ASSET_URL=$(curl -fsSL https://api.github.com/repos/theos/sdks/releases/latest \
+                      | grep '"browser_download_url".*iPhoneOS16\.5\.sdk\.tar\.xz' \
+                      | head -1 | cut -d'"' -f4)
+          if [ -z "$ASSET_URL" ]; then
+            echo "iPhoneOS16.5.sdk.tar.xz not in latest release; trying master-146e41f tag"
+            ASSET_URL="https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz"
+          fi
+          echo "Downloading: $ASSET_URL"
+          curl -fsSL -O "$ASSET_URL"
           tar -xf iPhoneOS16.5.sdk.tar.xz
           rm iPhoneOS16.5.sdk.tar.xz
           ls -la
