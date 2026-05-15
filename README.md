@@ -16,11 +16,15 @@ troll/
 │   ├── Resources/TrollStore.tar    upstream 2.1.1 release 资产，预先放好
 │   ├── build.sh            把 deltas splice 进 third_party 并跑 Theos 构建
 │   └── Makefile
-├── mxrestore/          宿主端 Python（Mac/Linux/Win + iTunes）
+├── mxrestore/          宿主端 Python CLI（Mac/Linux/Win + iTunes）
 │   ├── mxrestore.py        fork 自 JJTech0130/TrollRestore@1.0
 │   ├── sparserestore/      vendor 自上游，**不要改**（CVE 武器化逻辑）
 │   ├── payload/PersistenceHelper_Embedded   由 mxhelper 编译产出
 │   └── requirements.txt
+├── mxrestore-gui/      宿主端 Tk GUI，PyInstaller 可打成 .app（macOS）
+│   ├── mxrestore_gui.py    fork 自 seregonwar/TrollRestore-GuiVersion
+│   ├── mxrestore-gui.spec  PyInstaller 配置
+│   └── README.md           运行/打包说明 —— 复用 mxrestore/ 的 sparserestore + payload
 ├── third_party/        pinned 上游
 │   ├── TrollRestore/    @ tag 1.0
 │   └── TrollStore/      @ tag 2.1.1

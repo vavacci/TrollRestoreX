@@ -1,0 +1,6 @@
+pymobiledevice3>=4.14,<7.0
+packaging
+bpylist2
+click
+ttkbootstrap>=1.10
+pyinstaller>=6.0
