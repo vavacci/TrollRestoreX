@@ -1,7 +1,6 @@
 #import "MXAutoFlow.h"
 #import <TSUtil.h>
 #import <CommonCrypto/CommonDigest.h>
-#import <objc/runtime.h>
 
 // State file: persistent across helper relaunches. Helper has no-sandbox so
 // /var/mobile/Library/Preferences is writable.
@@ -22,35 +21,10 @@ static NSString* const kStateDone       = @"done";
 
 @implementation MXAutoFlow
 
-#pragma mark - viewDidLoad swizzle (injection point)
-
-// We hook TSHRootViewController.viewDidLoad rather than forking the file, so
-// upstream changes don't require a manual merge. Runs the auto-flow once at
-// the end of the original viewDidLoad.
-static void (*g_origViewDidLoad)(id, SEL) = NULL;
-static void mx_swizzled_viewDidLoad(id self, SEL _cmd)
-{
-    if (g_origViewDidLoad) g_origViewDidLoad(self, _cmd);
-    if ([self isKindOfClass:UIViewController.class]) {
-        [MXAutoFlow runOnceWithViewController:(UIViewController*)self];
-    }
-}
-
-+ (void)load
-{
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        Class cls = NSClassFromString(@"TSHRootViewController");
-        if (!cls) {
-            NSLog(@"[MXAutoFlow] TSHRootViewController not found, skipping swizzle");
-            return;
-        }
-        Method m = class_getInstanceMethod(cls, @selector(viewDidLoad));
-        if (!m) return;
-        g_origViewDidLoad = (void (*)(id, SEL))method_getImplementation(m);
-        method_setImplementation(m, (IMP)mx_swizzled_viewDidLoad);
-    });
-}
+// NOTE: injection point is now an explicit call from a forked copy of
+// TSHRootViewController.m (see build.sh), NOT a +load swizzle. The earlier
+// swizzle ran during dyld image load and was rejected on iOS 15.x — symptom
+// was the helper failing to launch with PID -1 and no amfid log.
 
 #pragma mark - Public
 

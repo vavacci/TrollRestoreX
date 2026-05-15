@@ -41,13 +41,29 @@ if [ ! -x "$FPS_BIN" ]; then
     (cd "$UPSTREAM/Exploits/fastPathSign" && make)
 fi
 
-# 1. Stage our deltas into the upstream tree. Save originals to a sentinel so
-#    we can `git checkout` them back at the end even if we crash midway.
-echo "[*] Staging mxhelper deltas into $UPSTREAM/TrollHelper/"
-cp "$HERE/MXAutoFlow.h"        "$UPSTREAM/TrollHelper/MXAutoFlow.h"
-cp "$HERE/MXAutoFlow.m"        "$UPSTREAM/TrollHelper/MXAutoFlow.m"
-cp "$HERE/mxconfig.plist"      "$UPSTREAM/TrollHelper/Resources/mxconfig.plist"
-cp "$HERE/Resources/TrollStore.tar" "$UPSTREAM/TrollHelper/Resources/TrollStore.tar"
+# 1. Stage our deltas into the upstream tree.
+#    MX_VANILLA=1 skips all of our injections and builds an upstream-equivalent
+#    binary — useful as an A/B test when debugging launch issues.
+# Always snapshot the upstream TSHRootViewController.m before we touch it, so
+# we can restore it in step 4 even if the build crashes midway (third_party is
+# vendored as flat files, no `git checkout` recovery).
+ORIG_TSHRVC="$UPSTREAM/TrollHelper/TSHRootViewController.m.mxorig"
+if [ ! -f "$ORIG_TSHRVC" ]; then
+    cp "$UPSTREAM/TrollHelper/TSHRootViewController.m" "$ORIG_TSHRVC"
+fi
+
+if [ "${MX_VANILLA:-0}" = "1" ]; then
+    echo "[*] MX_VANILLA=1 → skipping mxhelper deltas (building upstream-equivalent)"
+    # Make sure the upstream controller is in place.
+    cp "$ORIG_TSHRVC" "$UPSTREAM/TrollHelper/TSHRootViewController.m"
+else
+    echo "[*] Staging mxhelper deltas into $UPSTREAM/TrollHelper/"
+    cp "$HERE/MXAutoFlow.h"             "$UPSTREAM/TrollHelper/MXAutoFlow.h"
+    cp "$HERE/MXAutoFlow.m"             "$UPSTREAM/TrollHelper/MXAutoFlow.m"
+    cp "$HERE/TSHRootViewController.m"  "$UPSTREAM/TrollHelper/TSHRootViewController.m"
+    cp "$HERE/mxconfig.plist"           "$UPSTREAM/TrollHelper/Resources/mxconfig.plist"
+    cp "$HERE/Resources/TrollStore.tar" "$UPSTREAM/TrollHelper/Resources/TrollStore.tar"
+fi
 
 # 2. Run the existing TrollHelper Theos build with EMBEDDED_ROOT_HELPER=1.
 #    The Makefile already globs *.m so MXAutoFlow.m gets picked up automatically.
@@ -74,4 +90,8 @@ rm -f "$UPSTREAM/TrollHelper/MXAutoFlow.h" \
       "$UPSTREAM/TrollHelper/MXAutoFlow.m" \
       "$UPSTREAM/TrollHelper/Resources/mxconfig.plist" \
       "$UPSTREAM/TrollHelper/Resources/TrollStore.tar"
+# Restore upstream TSHRootViewController.m from our snapshot.
+if [ -f "$ORIG_TSHRVC" ]; then
+    cp "$ORIG_TSHRVC" "$UPSTREAM/TrollHelper/TSHRootViewController.m"
+fi
 (cd "$UPSTREAM/TrollHelper" && make clean >/dev/null || true)
