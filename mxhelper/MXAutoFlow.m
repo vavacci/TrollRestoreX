@@ -338,9 +338,23 @@ static NSString* const kStateDone       = @"done";
     });
     dispatch_resume(timer);
 
-    MXLog(@"calling spawnRoot install force %@", ipaPath);
+    // CRITICAL: rootHelperPath() returns OUR own embedded helper, but its
+    // signApp() is a hardcoded "return -1" stub when EMBEDDED_ROOT_HELPER=1
+    // is set (see TrollStore/RootHelper/main.m line 498-504 in upstream).
+    // We MUST use the full trollstorehelper that lives inside the just-installed
+    // TrollStore.app — that one has the real signApp implementation.
+    NSString* fullHelper = [trollStoreAppPath() stringByAppendingPathComponent:@"trollstorehelper"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:fullHelper]) {
+        NSString* errMsg = [NSString stringWithFormat:@"full trollstorehelper not found at %@ — TrollStore install must have failed silently", fullHelper];
+        MXLog(@"%@", errMsg);
+        [MXAutoFlow writeState:kStateTSInstalled lastError:errMsg];
+        [self finishWithSuccess:NO message:@"找不到 TrollStore 自带的 trollstorehelper，TrollStore 没装好"];
+        dispatch_source_cancel(timer);
+        return NO;
+    }
+    MXLog(@"calling spawnRoot %@ install force %@", fullHelper, ipaPath);
     NSString* out = nil, *err = nil;
-    int ret = spawnRoot(rootHelperPath(), @[@"install", @"force", ipaPath], &out, &err);
+    int ret = spawnRoot(fullHelper, @[@"install", @"force", ipaPath], &out, &err);
     NSTimeInterval installSec = -[installStart timeIntervalSinceNow];
     MXLog(@"spawnRoot install returned %d after %.1fs", ret, installSec);
     if (out.length) MXLog(@"install stdout (%lu B):\n%@", (unsigned long)out.length, out);
