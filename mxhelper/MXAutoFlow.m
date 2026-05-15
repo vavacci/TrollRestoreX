@@ -196,8 +196,9 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
     return pending;
 }
 
-#pragma mark - HUD wrappers (use upstream's TSPresentationDelegate so the
-#  native PSListController stays visible underneath the modal)
+#pragma mark - HUD wrappers
+// Use upstream's TSPresentationDelegate so the native PSListController stays
+// visible underneath the modal HUD.
 
 - (void)hudShow:(NSString*)msg
 {
