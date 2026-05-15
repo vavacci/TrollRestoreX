@@ -32,36 +32,52 @@ PAYLOAD_PATH = Path(__file__).resolve().parent / "payload" / "PersistenceHelper_
 MXCONFIG_PATH = Path(__file__).resolve().parent.parent / "mxhelper" / "mxconfig.plist"
 
 
-def _read_ipa_url() -> str | None:
-    """Return the IPA URL from mxhelper/mxconfig.plist if set, else None."""
+def _read_app_urls() -> list[tuple[str, str]]:
+    """Return [(name, url), ...] from mxhelper/mxconfig.plist. Supports both
+    the new `Apps` array format and the legacy single `IPAURL` field."""
     if not MXCONFIG_PATH.exists():
-        return None
+        return []
     try:
         with open(MXCONFIG_PATH, "rb") as f:
             cfg = plistlib.load(f)
-        url = cfg.get("IPAURL") or ""
-        return url.strip() or None
     except Exception:
-        return None
+        return []
+    out: list[tuple[str, str]] = []
+    for app in cfg.get("Apps") or []:
+        if not isinstance(app, dict):
+            continue
+        url = (app.get("URL") or "").strip()
+        if not url or url.startswith(("https://example.com", "http://example.com")):
+            continue
+        name = (app.get("Name") or "").strip() or url.rsplit("/", 1)[-1]
+        out.append((name, url))
+    if not out:
+        legacy = (cfg.get("IPAURL") or "").strip()
+        if legacy and not legacy.startswith(("https://example.com", "http://example.com")):
+            out.append((legacy.rsplit("/", 1)[-1], legacy))
+    return out
 
 
 def _print_post_install_url(progress: bool) -> None:
-    """After TrollRestore succeeds, surface the apple-magnifier:// URL that
-    will install the configured target IPA. Works regardless of whether the
-    binary is the CI-built MXAutoFlow version (which would auto-install) or
-    the opa334 fallback (which needs this manual step)."""
-    url = _read_ipa_url()
-    if not url or url.startswith(("https://example.com", "http://example.com")):
+    """After TrollRestore succeeds, surface the apple-magnifier:// URLs that
+    will install each configured IPA. Useful as a fallback when the helper
+    binary is opa334's vanilla version (no MXAutoFlow); the CI-built version
+    auto-installs and these URLs are redundant."""
+    apps = _read_app_urls()
+    if not apps:
         return
-    install_url = f"apple-magnifier://install?url={urllib.parse.quote(url, safe=':/?&=')}"
     if progress:
-        _emit(True, stage="post_install_url", url=install_url, ipa_url=url)
+        for name, url in apps:
+            install_url = f"apple-magnifier://install?url={urllib.parse.quote(url, safe=':/?&=')}"
+            _emit(True, stage="post_install_url", name=name, url=install_url, ipa_url=url)
         return
-    click.secho("\n── 装完 TrollStore 后，再做下面这一步装目标应用 ──", fg="cyan", bold=True)
-    click.secho("  iPhone 上 Safari 打开:", fg="cyan")
-    click.secho(f"  {install_url}\n", fg="white")
-    click.secho("  (如果 helper 是 GH Actions 编出来的自动版，这步会自动跑，"
-                "你可以忽略上面的链接。)\n", fg="bright_black")
+    click.secho("\n── 装完 TrollStore 后，下面是 IPA 的 apple-magnifier 安装链接 ──", fg="cyan", bold=True)
+    click.secho("  CI 编译版 helper 会自动装这些；如果是 opa334 兜底版本，需要在 iPhone Safari 里逐个打开:\n", fg="cyan")
+    for name, url in apps:
+        install_url = f"apple-magnifier://install?url={urllib.parse.quote(url, safe=':/?&=')}"
+        click.secho(f"  {name}:", fg="yellow")
+        click.secho(f"    {install_url}", fg="white")
+    click.echo("")
 
 
 def _emit(progress, **kw):

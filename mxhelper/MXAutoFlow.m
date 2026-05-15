@@ -1,5 +1,6 @@
 #import "MXAutoFlow.h"
 #import <TSUtil.h>
+#import <TSPresentationDelegate.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <mach-o/getsect.h>
 
@@ -34,17 +35,10 @@ extern const struct mach_header_64 _mh_execute_header;
 // /var/mobile/Library/Preferences is writable.
 static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa334.trollstorepersistencehelper.mxstate.plist";
 
-// State machine values.
-static NSString* const kStateInit       = @"init";
-static NSString* const kStateTSInstalled = @"ts_installed";
-static NSString* const kStateDone       = @"done";
-
 @interface MXAutoFlow ()
 @property (nonatomic, weak)   UIViewController* host;
-@property (nonatomic, strong) UIView*           overlay;
-@property (nonatomic, strong) UILabel*          statusLabel;
-@property (nonatomic, strong) UIActivityIndicatorView* spinner;
 @property (nonatomic, strong) NSDictionary*     config;
+@property (nonatomic, strong) NSArray*          apps;       // [{URL, SHA256, Name}]
 @end
 
 @implementation MXAutoFlow
@@ -61,28 +55,37 @@ static NSString* const kStateDone       = @"done";
     MXLog(@"runOnce called. uid=%d pid=%d bundlePath=%@",
           getuid(), getpid(), NSBundle.mainBundle.bundlePath);
 
-    NSString* state = [self readState];
-    MXLog(@"current state = %@", state ?: @"<nil>");
-    if ([state isEqualToString:kStateDone]) {
-        MXLog(@"state == done, nothing to do");
+    NSDictionary* cfg = [self loadConfig];
+    if (!cfg) {
+        MXLog(@"mxconfig.plist missing or unreadable, skipping auto flow");
+        return;
+    }
+    NSArray* apps = [self appsFromConfig:cfg];
+    if (apps.count == 0) {
+        MXLog(@"no apps configured, skipping auto flow");
         return;
     }
 
-    NSDictionary* cfg = [self loadConfig];
-    if (!cfg || ![cfg[@"IPAURL"] isKindOfClass:NSString.class] || [cfg[@"IPAURL"] length] == 0) {
-        MXLog(@"mxconfig.plist missing or IPAURL empty, skipping auto flow");
+    // Decide what work is left.
+    BOOL needsTS = ![self isTrollStoreInstalled];
+    NSArray* pending = [self pendingAppsFromList:apps];
+    MXLog(@"work check: needsTrollStore=%d apps_total=%lu apps_pending=%lu",
+          needsTS, (unsigned long)apps.count, (unsigned long)pending.count);
+
+    if (!needsTS && pending.count == 0) {
+        // Nothing to do — let the underlying PSListController render normally.
+        MXLog(@"all done, falling through to native helper UI");
         return;
     }
-    MXLog(@"loaded config: IPAURL=%@", cfg[@"IPAURL"]);
 
     MXAutoFlow* flow = [[MXAutoFlow alloc] init];
     flow.host = vc;
     flow.config = cfg;
-    [flow attachOverlay];
-    [flow kickoffFromState:state ?: kStateInit];
+    flow.apps = apps;
+    [flow kickoff];
 }
 
-#pragma mark - Config + state I/O
+#pragma mark - Config
 
 + (NSData*)dataForEmbeddedSection:(const char*)sectName
 {
@@ -97,7 +100,6 @@ static NSString* const kStateDone       = @"done";
 {
     NSData* d = [self dataForEmbeddedSection:"__mxconfig"];
     if (!d) {
-        // Fallback for builds without -sectcreate (e.g. running in simulator).
         NSString* p = [NSBundle.mainBundle pathForResource:@"mxconfig" ofType:@"plist"];
         if (p) d = [NSData dataWithContentsOfFile:p];
     }
@@ -111,147 +113,204 @@ static NSString* const kStateDone       = @"done";
     return [dict isKindOfClass:NSDictionary.class] ? dict : nil;
 }
 
-+ (NSString*)readState
++ (NSArray*)appsFromConfig:(NSDictionary*)cfg
 {
-    NSDictionary* d = [NSDictionary dictionaryWithContentsOfFile:kMXStateFile];
-    return d[@"state"];
+    NSMutableArray* out = [NSMutableArray array];
+
+    // New format: top-level "Apps" array of dicts.
+    NSArray* arr = cfg[@"Apps"];
+    if ([arr isKindOfClass:NSArray.class]) {
+        for (id item in arr) {
+            if (![item isKindOfClass:NSDictionary.class]) continue;
+            NSString* url = item[@"URL"];
+            if (![url isKindOfClass:NSString.class] || url.length == 0) continue;
+            [out addObject:item];
+        }
+    }
+
+    // Legacy fallback: a single top-level IPAURL.
+    if (out.count == 0) {
+        NSString* legacyURL = cfg[@"IPAURL"];
+        if ([legacyURL isKindOfClass:NSString.class] && legacyURL.length > 0
+            && ![legacyURL hasPrefix:@"https://example.com"]) {
+            NSMutableDictionary* d = [NSMutableDictionary dictionary];
+            d[@"URL"] = legacyURL;
+            if ([cfg[@"IPASHA256"] isKindOfClass:NSString.class]) d[@"SHA256"] = cfg[@"IPASHA256"];
+            [out addObject:d];
+        }
+    }
+    return out;
 }
 
-+ (void)writeState:(NSString*)state lastError:(NSString*)err
+#pragma mark - State
+
++ (NSMutableDictionary*)readStateMutable
 {
-    NSMutableDictionary* d = [NSMutableDictionary dictionary];
-    d[@"state"] = state ?: @"";
+    NSDictionary* d = [NSDictionary dictionaryWithContentsOfFile:kMXStateFile];
+    return d ? [d mutableCopy] : [NSMutableDictionary dictionary];
+}
+
++ (void)writeState:(NSDictionary*)state
+{
+    NSMutableDictionary* d = state.mutableCopy;
     d[@"updated_at"] = @([NSDate.date timeIntervalSince1970]);
-    if (err) d[@"last_error"] = err;
     [d writeToFile:kMXStateFile atomically:YES];
 }
 
-#pragma mark - UI overlay
-
-- (void)attachOverlay
++ (BOOL)isTrollStoreInstalled
 {
-    UIView* root = self.host.view;
-    self.overlay = [[UIView alloc] initWithFrame:root.bounds];
-    self.overlay.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    self.overlay.backgroundColor = [UIColor systemBackgroundColor];
-
-    self.spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
-    self.spinner.translatesAutoresizingMaskIntoConstraints = NO;
-    [self.spinner startAnimating];
-    [self.overlay addSubview:self.spinner];
-
-    self.statusLabel = [[UILabel alloc] init];
-    self.statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    self.statusLabel.textAlignment = NSTextAlignmentCenter;
-    self.statusLabel.numberOfLines = 0;
-    self.statusLabel.font = [UIFont systemFontOfSize:16];
-    self.statusLabel.text = @"准备中…";
-    [self.overlay addSubview:self.statusLabel];
-
-    [root addSubview:self.overlay];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [self.spinner.centerXAnchor constraintEqualToAnchor:self.overlay.centerXAnchor],
-        [self.spinner.centerYAnchor constraintEqualToAnchor:self.overlay.centerYAnchor constant:-20],
-        [self.statusLabel.topAnchor constraintEqualToAnchor:self.spinner.bottomAnchor constant:20],
-        [self.statusLabel.leadingAnchor constraintEqualToAnchor:self.overlay.leadingAnchor constant:24],
-        [self.statusLabel.trailingAnchor constraintEqualToAnchor:self.overlay.trailingAnchor constant:-24],
-    ]];
+    // Authoritative: TrollStore.app on disk after install-trollstore succeeds.
+    NSString* appPath = trollStoreAppPath();
+    return appPath && [[NSFileManager defaultManager] fileExistsAtPath:appPath];
 }
 
-- (void)setStatus:(NSString*)text
++ (BOOL)isAppURLInstalled:(NSString*)url
+{
+    NSDictionary* state = [NSDictionary dictionaryWithContentsOfFile:kMXStateFile];
+    NSDictionary* installed = state[@"installed_apps"];
+    return [installed isKindOfClass:NSDictionary.class] && [installed[url] boolValue];
+}
+
++ (void)markAppURLInstalled:(NSString*)url
+{
+    NSMutableDictionary* state = [self readStateMutable];
+    NSMutableDictionary* installed = [state[@"installed_apps"] mutableCopy] ?: [NSMutableDictionary dictionary];
+    installed[url] = @YES;
+    state[@"installed_apps"] = installed;
+    [self writeState:state];
+}
+
++ (void)recordError:(NSString*)err
+{
+    NSMutableDictionary* state = [self readStateMutable];
+    state[@"last_error"] = err ?: @"";
+    [self writeState:state];
+}
+
++ (NSArray*)pendingAppsFromList:(NSArray*)apps
+{
+    NSMutableArray* pending = [NSMutableArray array];
+    for (NSDictionary* app in apps) {
+        if (![self isAppURLInstalled:app[@"URL"]]) [pending addObject:app];
+    }
+    return pending;
+}
+
+#pragma mark - HUD wrappers (use upstream's TSPresentationDelegate so the
+#  native PSListController stays visible underneath the modal)
+
+- (void)hudShow:(NSString*)msg
 {
     dispatch_async(dispatch_get_main_queue(), ^{
-        self.statusLabel.text = text;
-    });
-}
-
-- (void)finishWithSuccess:(BOOL)ok message:(NSString*)msg
-{
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self.spinner stopAnimating];
-        self.spinner.hidden = YES;
-        self.statusLabel.text = msg;
-
-        UIButton* btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        btn.translatesAutoresizingMaskIntoConstraints = NO;
-        [btn setTitle:(ok ? @"完成" : @"重试") forState:UIControlStateNormal];
-        btn.titleLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
-        [btn addTarget:self action:(ok ? @selector(dismissOverlay) : @selector(retryPressed)) forControlEvents:UIControlEventTouchUpInside];
-        [self.overlay addSubview:btn];
-        [NSLayoutConstraint activateConstraints:@[
-            [btn.centerXAnchor constraintEqualToAnchor:self.overlay.centerXAnchor],
-            [btn.topAnchor constraintEqualToAnchor:self.statusLabel.bottomAnchor constant:24],
-        ]];
-    });
-}
-
-- (void)dismissOverlay
-{
-    [self.overlay removeFromSuperview];
-}
-
-- (void)retryPressed
-{
-    // Wipe state then re-kick the flow from INIT.
-    [[NSFileManager defaultManager] removeItemAtPath:kMXStateFile error:nil];
-    [self.overlay removeFromSuperview];
-    [MXAutoFlow runOnceWithViewController:self.host];
-}
-
-#pragma mark - State machine
-
-- (void)kickoffFromState:(NSString*)state
-{
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        @try {
-            [self runStateMachine:state];
-        } @catch (NSException* e) {
-            NSLog(@"[MXAutoFlow] exception: %@", e);
-            [self finishWithSuccess:NO message:[NSString stringWithFormat:@"内部错误: %@", e.reason]];
+        TSPresentationDelegate.presentationViewController = self.host;
+        if (TSPresentationDelegate.activityController) {
+            // Already up — just patch the message in place.
+            TSPresentationDelegate.activityController.message = msg;
+        } else {
+            [TSPresentationDelegate startActivity:msg];
         }
     });
 }
 
-- (void)runStateMachine:(NSString*)state
+- (void)hudUpdate:(NSString*)msg
 {
-    MXLog(@"state machine entry, state=%@", state ?: @"<init>");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (TSPresentationDelegate.activityController) {
+            TSPresentationDelegate.activityController.message = msg;
+        }
+    });
+}
 
-    if ([state isEqualToString:kStateInit] || state.length == 0) {
-        MXLog(@"=== step 1: install TrollStore ===");
+- (void)hudDismissThen:(void(^)(void))completion
+{
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (TSPresentationDelegate.activityController) {
+            [TSPresentationDelegate stopActivityWithCompletion:completion];
+        } else if (completion) {
+            completion();
+        }
+    });
+}
+
+- (void)hudShowAlert:(NSString*)title message:(NSString*)msg
+{
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIAlertController* a = [UIAlertController alertControllerWithTitle:title
+                                                                   message:msg
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+        [self.host presentViewController:a animated:YES completion:nil];
+    });
+}
+
+#pragma mark - State machine entry
+
+- (void)kickoff
+{
+    [self hudShow:@"准备中…"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        @try {
+            [self runStateMachine];
+        } @catch (NSException* e) {
+            MXLog(@"exception: %@", e);
+            [self hudDismissThen:^{
+                [self hudShowAlert:@"内部错误" message:e.reason];
+            }];
+        }
+    });
+}
+
+- (void)runStateMachine
+{
+    MXLog(@"state machine entry, %lu app(s) configured", (unsigned long)self.apps.count);
+
+    // Step 1: TrollStore (skip if already on disk).
+    if (![MXAutoFlow isTrollStoreInstalled]) {
+        MXLog(@"=== installing TrollStore ===");
+        [self hudUpdate:@"正在安装 TrollStore…"];
         NSDate* t0 = NSDate.date;
         BOOL ok = [self stepInstallTrollStore];
-        MXLog(@"step 1 returned %@ after %.1fs", ok ? @"YES" : @"NO", -[t0 timeIntervalSinceNow]);
+        MXLog(@"install-trollstore step returned %@ after %.1fs", ok?@"YES":@"NO", -[t0 timeIntervalSinceNow]);
         if (!ok) return;
-        state = kStateTSInstalled;
-        [MXAutoFlow writeState:state lastError:nil];
+    } else {
+        MXLog(@"TrollStore already installed, skipping");
     }
 
-    if ([state isEqualToString:kStateTSInstalled]) {
-        MXLog(@"=== step 2: install target IPA ===");
+    // Step 2..N: each pending app.
+    NSUInteger total = self.apps.count;
+    NSUInteger done  = 0;
+    for (NSDictionary* app in self.apps) {
+        done++;
+        NSString* url = app[@"URL"];
+        if ([MXAutoFlow isAppURLInstalled:url]) {
+            MXLog(@"[%lu/%lu] skip already-installed: %@", (unsigned long)done, (unsigned long)total, url);
+            continue;
+        }
+        NSString* name = [app[@"Name"] isKindOfClass:NSString.class] ? app[@"Name"] : url.lastPathComponent;
+        MXLog(@"=== [%lu/%lu] installing %@ (%@) ===", (unsigned long)done, (unsigned long)total, name, url);
+        [self hudUpdate:[NSString stringWithFormat:@"正在装 %@\n(%lu / %lu)", name, (unsigned long)done, (unsigned long)total]];
         NSDate* t0 = NSDate.date;
-        BOOL ok = [self stepInstallTargetIpa];
-        MXLog(@"step 2 returned %@ after %.1fs", ok ? @"YES" : @"NO", -[t0 timeIntervalSinceNow]);
+        BOOL ok = [self stepInstallApp:app index:done total:total];
+        MXLog(@"app step returned %@ after %.1fs", ok?@"YES":@"NO", -[t0 timeIntervalSinceNow]);
         if (!ok) return;
-        state = kStateDone;
-        [MXAutoFlow writeState:state lastError:nil];
+        [MXAutoFlow markAppURLInstalled:url];
     }
 
     MXLog(@"state machine done");
-    [self finishWithSuccess:YES message:@"全部完成。\n可以回到桌面打开应用。"];
+    [self hudDismissThen:nil];   // Just dismiss; native helper UI is underneath.
 }
 
 #pragma mark - Steps
 
 - (BOOL)stepInstallTrollStore
 {
-    [self setStatus:@"正在安装 TrollStore…"];
-
     NSData* tarData = [MXAutoFlow dataForEmbeddedSection:"__tstar"];
     if (!tarData || tarData.length < 1024) {
-        [MXAutoFlow writeState:kStateInit lastError:@"TrollStore.tar __DATA section missing"];
-        [self finishWithSuccess:NO
-                        message:@"helper 二进制里没烤进 TrollStore.tar。要么换成 GH Actions CI 编出来的版本，要么编译时确保 mxhelper/Resources/TrollStore.tar 存在。"];
+        [MXAutoFlow recordError:@"TrollStore.tar __DATA section missing"];
+        [self hudDismissThen:^{
+            [self hudShowAlert:@"TrollStore 安装失败"
+                       message:@"helper 二进制里没烤进 TrollStore.tar。要么用 GH Actions CI 编出来的版本，要么编译时确保 mxhelper/Resources/TrollStore.tar 存在。"];
+        }];
         return NO;
     }
 
@@ -259,116 +318,123 @@ static NSString* const kStateDone       = @"done";
     [[NSFileManager defaultManager] removeItemAtPath:tmpTar error:nil];
     NSError* writeErr = nil;
     if (![tarData writeToFile:tmpTar options:NSDataWritingAtomic error:&writeErr]) {
-        [MXAutoFlow writeState:kStateInit lastError:writeErr.localizedDescription];
-        [self finishWithSuccess:NO message:[NSString stringWithFormat:@"落地 TrollStore.tar 失败: %@", writeErr.localizedDescription]];
+        [MXAutoFlow recordError:writeErr.localizedDescription];
+        [self hudDismissThen:^{
+            [self hudShowAlert:@"写 TrollStore.tar 失败" message:writeErr.localizedDescription];
+        }];
         return NO;
     }
 
-    MXLog(@"calling spawnRoot install-trollstore %@ (tar size %llu)", tmpTar,
-          (unsigned long long)[[[NSFileManager defaultManager] attributesOfItemAtPath:tmpTar error:nil][NSFileSize] longLongValue]);
     NSString* out = nil, *err = nil;
-    NSDate* t0 = NSDate.date;
     int ret = spawnRoot(rootHelperPath(), @[@"install-trollstore", tmpTar], &out, &err);
-    MXLog(@"install-trollstore returned %d after %.1fs", ret, -[t0 timeIntervalSinceNow]);
-    if (out.length) MXLog(@"install-trollstore stdout (%lu B):\n%@", (unsigned long)out.length, out);
-    if (err.length) MXLog(@"install-trollstore stderr (%lu B):\n%@", (unsigned long)err.length, err);
+    MXLog(@"install-trollstore ret=%d", ret);
+    if (out.length) MXLog(@"install-trollstore stdout:\n%@", out);
+    if (err.length) MXLog(@"install-trollstore stderr:\n%@", err);
     [[NSFileManager defaultManager] removeItemAtPath:tmpTar error:nil];
 
     if (ret != 0) {
-        NSString* detail = [NSString stringWithFormat:@"trollstorehelper install-trollstore => %d\n%@\n%@", ret, out ?: @"", err ?: @""];
-        NSLog(@"[MXAutoFlow] %@", detail);
-        [MXAutoFlow writeState:kStateInit lastError:detail];
-        [self finishWithSuccess:NO message:[NSString stringWithFormat:@"安装 TrollStore 失败 (%d)", ret]];
+        NSString* detail = [NSString stringWithFormat:@"install-trollstore => %d\nSTDOUT:\n%@\nSTDERR:\n%@", ret, out?:@"", err?:@""];
+        [MXAutoFlow recordError:detail];
+        [self hudDismissThen:^{
+            [self hudShowAlert:@"TrollStore 安装失败"
+                       message:[NSString stringWithFormat:@"trollstorehelper ret=%d，详见 /var/mobile/Library/Logs/mxhelper.log", ret]];
+        }];
         return NO;
     }
     return YES;
 }
 
-- (BOOL)stepInstallTargetIpa
+- (BOOL)stepInstallApp:(NSDictionary*)app index:(NSUInteger)idx total:(NSUInteger)total
 {
-    NSString* urlStr  = self.config[@"IPAURL"];
-    NSString* wantSha = self.config[@"IPASHA256"];
-    if (![wantSha isKindOfClass:NSString.class]) wantSha = nil;
+    NSString* url     = app[@"URL"];
+    NSString* wantSha = [app[@"SHA256"] isKindOfClass:NSString.class] ? app[@"SHA256"] : nil;
+    NSString* name    = [app[@"Name"] isKindOfClass:NSString.class] ? app[@"Name"] : url.lastPathComponent;
 
-    [self setStatus:[NSString stringWithFormat:@"正在下载应用…\n%@", urlStr]];
+    [self hudUpdate:[NSString stringWithFormat:@"正在下载 %@\n(%lu / %lu)", name, (unsigned long)idx, (unsigned long)total]];
 
-    NSString* ipaPath = [NSTemporaryDirectory() stringByAppendingPathComponent:@"mxtarget.ipa"];
+    NSString* ipaPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"mx_%lu.ipa", (unsigned long)idx]];
     [[NSFileManager defaultManager] removeItemAtPath:ipaPath error:nil];
 
     NSError* dlErr = nil;
-    if (![self downloadURL:[NSURL URLWithString:urlStr] toPath:ipaPath error:&dlErr]) {
-        [MXAutoFlow writeState:kStateTSInstalled lastError:dlErr.localizedDescription];
-        [self finishWithSuccess:NO message:[NSString stringWithFormat:@"下载 IPA 失败: %@", dlErr.localizedDescription]];
+    if (![self downloadURL:[NSURL URLWithString:url] toPath:ipaPath error:&dlErr]) {
+        [MXAutoFlow recordError:dlErr.localizedDescription];
+        [self hudDismissThen:^{
+            [self hudShowAlert:[NSString stringWithFormat:@"%@ 下载失败", name] message:dlErr.localizedDescription];
+        }];
+        return NO;
+    }
+
+    long long ipaSize = [[[NSFileManager defaultManager] attributesOfItemAtPath:ipaPath error:nil][NSFileSize] longLongValue];
+    MXLog(@"downloaded %@ size=%lld bytes", name, ipaSize);
+
+    if (ipaSize < 100*1024) {
+        [MXAutoFlow recordError:[NSString stringWithFormat:@"%@ size suspiciously small: %lld bytes", name, ipaSize]];
+        [self hudDismissThen:^{
+            [self hudShowAlert:[NSString stringWithFormat:@"%@ 下载异常", name]
+                       message:[NSString stringWithFormat:@"只下到 %lld 字节，多半是 CDN 返回了 HTML 错误页", ipaSize]];
+        }];
+        [[NSFileManager defaultManager] removeItemAtPath:ipaPath error:nil];
         return NO;
     }
 
     if (wantSha.length == 64) {
         NSString* gotSha = [MXAutoFlow sha256OfFile:ipaPath];
         if ([gotSha caseInsensitiveCompare:wantSha] != NSOrderedSame) {
-            NSString* msg = [NSString stringWithFormat:@"IPA SHA256 不匹配\n期望 %@\n实际 %@", wantSha, gotSha];
-            [MXAutoFlow writeState:kStateTSInstalled lastError:msg];
-            [self finishWithSuccess:NO message:msg];
+            NSString* msg = [NSString stringWithFormat:@"期望 %@\n实际 %@", wantSha, gotSha];
+            [MXAutoFlow recordError:msg];
+            [self hudDismissThen:^{
+                [self hudShowAlert:[NSString stringWithFormat:@"%@ SHA256 不匹配", name] message:msg];
+            }];
             [[NSFileManager defaultManager] removeItemAtPath:ipaPath error:nil];
             return NO;
         }
     }
 
-    [self setStatus:@"正在安装应用…"];
-
-    // File size sanity check before handing to trollstorehelper.
-    NSDictionary* attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:ipaPath error:nil];
-    long long ipaSize = [attrs[NSFileSize] longLongValue];
-    MXLog(@"downloaded ipa: path=%@ size=%lld bytes", ipaPath, ipaSize);
-    if (ipaSize < 100*1024) {
-        [MXAutoFlow writeState:kStateTSInstalled lastError:[NSString stringWithFormat:@"IPA size suspiciously small: %lld bytes — CDN probably returned an HTML error page", ipaSize]];
-        [self finishWithSuccess:NO message:[NSString stringWithFormat:@"下载的 IPA 太小 (%lld 字节)，多半是 CDN 返回了 HTML 错误页", ipaSize]];
+    // CRITICAL: must use TrollStore's full trollstorehelper, NOT our embedded
+    // one. Embedded helper's signApp() is hardcoded to return -1 (upstream
+    // RootHelper/main.m:498-504 — comment says "embedded root helper not able
+    // to sign apps but doesn't need that functionality anyways", which is
+    // wrong for our use case).
+    NSString* fullHelper = [trollStoreAppPath() stringByAppendingPathComponent:@"trollstorehelper"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:fullHelper]) {
+        NSString* errMsg = [NSString stringWithFormat:@"full trollstorehelper missing at %@", fullHelper];
+        [MXAutoFlow recordError:errMsg];
+        [self hudDismissThen:^{
+            [self hudShowAlert:@"TrollStore 损坏" message:errMsg];
+        }];
         [[NSFileManager defaultManager] removeItemAtPath:ipaPath error:nil];
         return NO;
     }
 
-    // Drive an elapsed-time ticker so the user can tell whether install is
-    // still working or genuinely hung. Updates "正在安装应用… (Xs)" every 2s.
     NSDate* installStart = NSDate.date;
-    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
-                                                     dispatch_get_main_queue());
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 2*NSEC_PER_SEC, 100*NSEC_PER_MSEC);
     dispatch_source_set_event_handler(timer, ^{
         NSTimeInterval elapsed = -[installStart timeIntervalSinceNow];
-        self.statusLabel.text = [NSString stringWithFormat:@"正在安装应用… (%.0fs)\n%lld MB", elapsed, ipaSize/1024/1024];
+        TSPresentationDelegate.activityController.message =
+            [NSString stringWithFormat:@"正在装 %@ (%.0fs)\n%lld MB · (%lu / %lu)",
+             name, elapsed, ipaSize/1024/1024, (unsigned long)idx, (unsigned long)total];
     });
     dispatch_resume(timer);
 
-    // CRITICAL: rootHelperPath() returns OUR own embedded helper, but its
-    // signApp() is a hardcoded "return -1" stub when EMBEDDED_ROOT_HELPER=1
-    // is set (see TrollStore/RootHelper/main.m line 498-504 in upstream).
-    // We MUST use the full trollstorehelper that lives inside the just-installed
-    // TrollStore.app — that one has the real signApp implementation.
-    NSString* fullHelper = [trollStoreAppPath() stringByAppendingPathComponent:@"trollstorehelper"];
-    if (![[NSFileManager defaultManager] fileExistsAtPath:fullHelper]) {
-        NSString* errMsg = [NSString stringWithFormat:@"full trollstorehelper not found at %@ — TrollStore install must have failed silently", fullHelper];
-        MXLog(@"%@", errMsg);
-        [MXAutoFlow writeState:kStateTSInstalled lastError:errMsg];
-        [self finishWithSuccess:NO message:@"找不到 TrollStore 自带的 trollstorehelper，TrollStore 没装好"];
-        dispatch_source_cancel(timer);
-        return NO;
-    }
-    MXLog(@"calling spawnRoot %@ install force %@", fullHelper, ipaPath);
     NSString* out = nil, *err = nil;
     int ret = spawnRoot(fullHelper, @[@"install", @"force", ipaPath], &out, &err);
     NSTimeInterval installSec = -[installStart timeIntervalSinceNow];
-    MXLog(@"spawnRoot install returned %d after %.1fs", ret, installSec);
-    if (out.length) MXLog(@"install stdout (%lu B):\n%@", (unsigned long)out.length, out);
-    if (err.length) MXLog(@"install stderr (%lu B):\n%@", (unsigned long)err.length, err);
+    MXLog(@"install %@ ret=%d after %.1fs", name, ret, installSec);
+    if (out.length) MXLog(@"install %@ stdout:\n%@", name, out);
+    if (err.length) MXLog(@"install %@ stderr:\n%@", name, err);
 
     dispatch_source_cancel(timer);
     [[NSFileManager defaultManager] removeItemAtPath:ipaPath error:nil];
 
     if (ret != 0) {
-        NSString* detail = [NSString stringWithFormat:@"trollstorehelper install => %d (took %.1fs)\nSTDOUT:\n%@\nSTDERR:\n%@",
-                            ret, installSec, out ?: @"", err ?: @""];
-        [MXAutoFlow writeState:kStateTSInstalled lastError:detail];
-        [self finishWithSuccess:NO
-                        message:[NSString stringWithFormat:@"安装目标应用失败 (ret=%d, %.0fs)\n详见 /var/mobile/Library/Logs/mxhelper.log", ret, installSec]];
+        NSString* detail = [NSString stringWithFormat:@"install %@ => %d (took %.1fs)\nSTDOUT:\n%@\nSTDERR:\n%@",
+                            name, ret, installSec, out?:@"", err?:@""];
+        [MXAutoFlow recordError:detail];
+        [self hudDismissThen:^{
+            [self hudShowAlert:[NSString stringWithFormat:@"%@ 安装失败", name]
+                       message:[NSString stringWithFormat:@"trollstorehelper ret=%d，详见 /var/mobile/Library/Logs/mxhelper.log", ret]];
+        }];
         return NO;
     }
     return YES;

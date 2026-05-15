@@ -2,11 +2,31 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>IPAURL</key>
-	<string>https://tosv.byted.org/obj/goldrush-ios-resource/laotie/livestream.tipa</string>
-	<key>IPASHA256</key>
-	<string></string>
-	<key>IPABundleID</key>
-	<string></string>
+    <!-- 多应用列表。helper 启动会按顺序检查每个 URL，没装的补装、已装的跳过。
+         可以随时在这里加新应用，下次启动只装新增的。
+         向后兼容：如果这里没填 Apps，但顶层有 IPAURL，会把 IPAURL 当成单应用兜底。 -->
+    <key>Apps</key>
+    <array>
+        <dict>
+            <!-- 必填：IPA 下载 URL -->
+            <key>URL</key>
+            <string>https://tosv.byted.org/obj/goldrush-ios-resource/laotie/livestream.tipa</string>
+
+            <!-- 可选：64 位 hex SHA256，留空跳过校验。强烈建议至少给生产 URL 配一个。 -->
+            <key>SHA256</key>
+            <string></string>
+
+            <!-- 可选：用于 UI 显示的友好名字。不填就用 URL 末段。 -->
+            <key>Name</key>
+            <string>livestream</string>
+        </dict>
+
+        <!-- 想加更多应用就再 commit 一个 dict，比如：
+        <dict>
+            <key>URL</key><string>https://your-cdn/another.ipa</string>
+            <key>Name</key><string>another</string>
+        </dict>
+        -->
+    </array>
 </dict>
 </plist>
