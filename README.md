@@ -54,10 +54,19 @@ make device         # 产出 mxrestore/payload/PersistenceHelper_Embedded
 
 ### 3. 装宿主端依赖
 
-任何平台：
+任何平台。**强烈建议用虚拟环境**（pymobiledevice3 必须 `<7.0`，跟系统全局环境可能冲突）：
 
 ```bash
-make host           # pip3 install -r mxrestore/requirements.txt
+cd mxrestore
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+或者 conda：
+
+```bash
+conda create -n trollrestorex python=3.11 && conda activate trollrestorex
+pip install -r mxrestore/requirements.txt
 ```
 
 ### 4. 跑

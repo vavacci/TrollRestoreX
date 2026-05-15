@@ -1,5 +1,8 @@
-pymobiledevice3
+# pymobiledevice3 removed cli.cli_common.Command in v7.0; upstream
+# JJTech0130/TrollRestore@1.0 depends on it, so we pin to <7.
+pymobiledevice3>=4.14,<7.0
 bpylist2
 rich
 requests
 click
+packaging
