@@ -3,6 +3,26 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <mach-o/getsect.h>
 
+// Log goes to two places so we can always retrieve it:
+//   - NSLog  → idevicesyslog | grep MXFLOW   (live)
+//   - /var/mobile/Library/Logs/mxhelper.log  (persistent, AFC-readable)
+static FILE* g_mxlog_fp = NULL;
+static void mxlog_init(void) {
+    if (g_mxlog_fp) return;
+    g_mxlog_fp = fopen("/var/mobile/Library/Logs/mxhelper.log", "a");
+    if (!g_mxlog_fp) g_mxlog_fp = fopen("/tmp/mxhelper.log", "a");
+}
+#define MXLog(fmt, ...) do { \
+    NSString* _s = [NSString stringWithFormat:(@"[MXFLOW] " fmt), ##__VA_ARGS__]; \
+    NSLog(@"%@", _s); \
+    mxlog_init(); \
+    if (g_mxlog_fp) { \
+        time_t _t = time(NULL); struct tm _tm; localtime_r(&_t, &_tm); \
+        char _ts[32]; strftime(_ts, sizeof(_ts), "%Y-%m-%d %H:%M:%S", &_tm); \
+        fprintf(g_mxlog_fp, "%s %s\n", _ts, _s.UTF8String); fflush(g_mxlog_fp); \
+    } \
+} while(0)
+
 // mxconfig.plist and TrollStore.tar are embedded into the binary via
 // -Wl,-sectcreate at link time (see mxhelper/build.sh). We pull them out at
 // runtime with getsectiondata so the helper bundle does NOT need any extra
@@ -38,17 +58,22 @@ static NSString* const kStateDone       = @"done";
 
 + (void)runOnceWithViewController:(UIViewController*)vc
 {
+    MXLog(@"runOnce called. uid=%d pid=%d bundlePath=%@",
+          getuid(), getpid(), NSBundle.mainBundle.bundlePath);
+
     NSString* state = [self readState];
+    MXLog(@"current state = %@", state ?: @"<nil>");
     if ([state isEqualToString:kStateDone]) {
-        return; // nothing to do, let the underlying UI render
+        MXLog(@"state == done, nothing to do");
+        return;
     }
 
     NSDictionary* cfg = [self loadConfig];
     if (!cfg || ![cfg[@"IPAURL"] isKindOfClass:NSString.class] || [cfg[@"IPAURL"] length] == 0) {
-        // No URL configured → bail silently, let user use the normal helper UI.
-        NSLog(@"[MXAutoFlow] mxconfig.plist missing or IPAURL empty, skipping auto flow");
+        MXLog(@"mxconfig.plist missing or IPAURL empty, skipping auto flow");
         return;
     }
+    MXLog(@"loaded config: IPAURL=%@", cfg[@"IPAURL"]);
 
     MXAutoFlow* flow = [[MXAutoFlow alloc] init];
     flow.host = vc;
@@ -190,18 +215,29 @@ static NSString* const kStateDone       = @"done";
 
 - (void)runStateMachine:(NSString*)state
 {
+    MXLog(@"state machine entry, state=%@", state ?: @"<init>");
+
     if ([state isEqualToString:kStateInit] || state.length == 0) {
-        if (![self stepInstallTrollStore]) return;
+        MXLog(@"=== step 1: install TrollStore ===");
+        NSDate* t0 = NSDate.date;
+        BOOL ok = [self stepInstallTrollStore];
+        MXLog(@"step 1 returned %@ after %.1fs", ok ? @"YES" : @"NO", -[t0 timeIntervalSinceNow]);
+        if (!ok) return;
         state = kStateTSInstalled;
         [MXAutoFlow writeState:state lastError:nil];
     }
 
     if ([state isEqualToString:kStateTSInstalled]) {
-        if (![self stepInstallTargetIpa]) return;
+        MXLog(@"=== step 2: install target IPA ===");
+        NSDate* t0 = NSDate.date;
+        BOOL ok = [self stepInstallTargetIpa];
+        MXLog(@"step 2 returned %@ after %.1fs", ok ? @"YES" : @"NO", -[t0 timeIntervalSinceNow]);
+        if (!ok) return;
         state = kStateDone;
         [MXAutoFlow writeState:state lastError:nil];
     }
 
+    MXLog(@"state machine done");
     [self finishWithSuccess:YES message:@"全部完成。\n可以回到桌面打开应用。"];
 }
 
@@ -228,8 +264,14 @@ static NSString* const kStateDone       = @"done";
         return NO;
     }
 
+    MXLog(@"calling spawnRoot install-trollstore %@ (tar size %llu)", tmpTar,
+          (unsigned long long)[[[NSFileManager defaultManager] attributesOfItemAtPath:tmpTar error:nil][NSFileSize] longLongValue]);
     NSString* out = nil, *err = nil;
+    NSDate* t0 = NSDate.date;
     int ret = spawnRoot(rootHelperPath(), @[@"install-trollstore", tmpTar], &out, &err);
+    MXLog(@"install-trollstore returned %d after %.1fs", ret, -[t0 timeIntervalSinceNow]);
+    if (out.length) MXLog(@"install-trollstore stdout (%lu B):\n%@", (unsigned long)out.length, out);
+    if (err.length) MXLog(@"install-trollstore stderr (%lu B):\n%@", (unsigned long)err.length, err);
     [[NSFileManager defaultManager] removeItemAtPath:tmpTar error:nil];
 
     if (ret != 0) {
@@ -273,17 +315,46 @@ static NSString* const kStateDone       = @"done";
 
     [self setStatus:@"正在安装应用…"];
 
+    // File size sanity check before handing to trollstorehelper.
+    NSDictionary* attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:ipaPath error:nil];
+    long long ipaSize = [attrs[NSFileSize] longLongValue];
+    MXLog(@"downloaded ipa: path=%@ size=%lld bytes", ipaPath, ipaSize);
+    if (ipaSize < 100*1024) {
+        [MXAutoFlow writeState:kStateTSInstalled lastError:[NSString stringWithFormat:@"IPA size suspiciously small: %lld bytes — CDN probably returned an HTML error page", ipaSize]];
+        [self finishWithSuccess:NO message:[NSString stringWithFormat:@"下载的 IPA 太小 (%lld 字节)，多半是 CDN 返回了 HTML 错误页", ipaSize]];
+        [[NSFileManager defaultManager] removeItemAtPath:ipaPath error:nil];
+        return NO;
+    }
+
+    // Drive an elapsed-time ticker so the user can tell whether install is
+    // still working or genuinely hung. Updates "正在安装应用… (Xs)" every 2s.
+    NSDate* installStart = NSDate.date;
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                                                     dispatch_get_main_queue());
+    dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 2*NSEC_PER_SEC, 100*NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(timer, ^{
+        NSTimeInterval elapsed = -[installStart timeIntervalSinceNow];
+        self.statusLabel.text = [NSString stringWithFormat:@"正在安装应用… (%.0fs)\n%lld MB", elapsed, ipaSize/1024/1024];
+    });
+    dispatch_resume(timer);
+
+    MXLog(@"calling spawnRoot install force %@", ipaPath);
     NSString* out = nil, *err = nil;
-    // "force" overwrites if same bundle id already exists; install also kicks
-    // uicache on completion (we do NOT pass skip-uicache).
     int ret = spawnRoot(rootHelperPath(), @[@"install", @"force", ipaPath], &out, &err);
+    NSTimeInterval installSec = -[installStart timeIntervalSinceNow];
+    MXLog(@"spawnRoot install returned %d after %.1fs", ret, installSec);
+    if (out.length) MXLog(@"install stdout (%lu B):\n%@", (unsigned long)out.length, out);
+    if (err.length) MXLog(@"install stderr (%lu B):\n%@", (unsigned long)err.length, err);
+
+    dispatch_source_cancel(timer);
     [[NSFileManager defaultManager] removeItemAtPath:ipaPath error:nil];
 
     if (ret != 0) {
-        NSString* detail = [NSString stringWithFormat:@"trollstorehelper install => %d\n%@\n%@", ret, out ?: @"", err ?: @""];
-        NSLog(@"[MXAutoFlow] %@", detail);
+        NSString* detail = [NSString stringWithFormat:@"trollstorehelper install => %d (took %.1fs)\nSTDOUT:\n%@\nSTDERR:\n%@",
+                            ret, installSec, out ?: @"", err ?: @""];
         [MXAutoFlow writeState:kStateTSInstalled lastError:detail];
-        [self finishWithSuccess:NO message:[NSString stringWithFormat:@"安装目标应用失败 (%d)", ret]];
+        [self finishWithSuccess:NO
+                        message:[NSString stringWithFormat:@"安装目标应用失败 (ret=%d, %.0fs)\n详见 /var/mobile/Library/Logs/mxhelper.log", ret, installSec]];
         return NO;
     }
     return YES;
