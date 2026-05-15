@@ -38,28 +38,47 @@ open dist/mxrestore-gui.app
 The .app contains a frozen Python runtime + all deps + the helper payload +
 `mxconfig.plist`. ~30-50 MB total.
 
-### Code signing & notarization (for distribution outside your own Mac)
+PyInstaller automatically ad-hoc signs every Mach-O inside the bundle
+(`codesign -s -`), which is **all Apple Silicon needs to launch the binary**.
+No Developer ID required.
 
-PyInstaller bundles ship unsigned by default; Gatekeeper will block them on
-other Macs. To distribute:
+### Distributing it (the easy way — what everyone in the community does)
+
+Just send `dist/mxrestore-gui.app` to whoever needs it (zip it first, AirDrop
+loses the bundle structure otherwise):
 
 ```sh
-# 1. Sign every .dylib + Mach-O inside the bundle (PyInstaller drops many)
-codesign --deep --force --options runtime \
-  --sign "Developer ID Application: YOUR NAME (TEAMID)" \
-  --entitlements entitlements.plist \
-  dist/mxrestore-gui.app
-
-# 2. Submit for notarization
-xcrun notarytool submit dist/mxrestore-gui.app \
-  --keychain-profile "AC_PASSWORD" --wait
-
-# 3. Staple the ticket
-xcrun stapler staple dist/mxrestore-gui.app
+cd dist && zip -r mxrestore-gui.zip mxrestore-gui.app
 ```
 
-If you don't need to share the .app off your own machine, skip this — just
-right-click → Open the first time.
+**On the recipient's Mac**, depending on how they got the .app:
+
+| How they got it | First-open ritual |
+|---|---|
+| AirDrop / U盘 / scp | Double-click. Done. |
+| Downloaded from a browser, email, Slack, etc. | Right-click the .app → **Open** → confirm "Open" in the dialog. **Once.** Then double-click normally. |
+| Already tried double-click and got blocked | `xattr -dr com.apple.quarantine /path/to/mxrestore-gui.app`  then double-click. |
+
+The "developer cannot be verified" warning is just the quarantine flag macOS
+attaches to anything downloaded from the internet. It's a **one-tap bypass**,
+not a wall. Every TrollStore/jailbreak tool out there ships exactly this way.
+
+### Optional: Developer ID + notarization
+
+You only need this if you want recipients to be able to **double-click on
+first launch with no right-click and no warning**. For this audience (people
+already using TrollStore) it's typically not worth the $99/yr Apple Developer
+account + the notarization roundtrip.
+
+If you do want it later:
+
+```sh
+codesign --deep --force --options runtime \
+  --sign "Developer ID Application: YOUR NAME (TEAMID)" \
+  dist/mxrestore-gui.app
+xcrun notarytool submit dist/mxrestore-gui.app --keychain-profile "AC_PASSWORD" --wait
+xcrun stapler staple dist/mxrestore-gui.app
+```
 
 ## What the GUI lets you do
 
