@@ -18,6 +18,29 @@ if [ -z "${THEOS:-}" ]; then
     exit 1
 fi
 
+# 0. Build fastPathSign first — TrollHelper's Makefile uses it as the
+#    codesign tool (TARGET_CODESIGN=../Exploits/fastPathSign/fastPathSign).
+#    Needs pkg-config + openssl (brew install pkg-config openssl).
+FPS_BIN="$UPSTREAM/Exploits/fastPathSign/fastPathSign"
+if [ ! -x "$FPS_BIN" ]; then
+    echo "[*] Building fastPathSign (host CoreTrust signer)"
+    if ! pkg-config --exists libcrypto; then
+        # macOS Homebrew ships openssl with its own pkgconfig dir not on PATH.
+        for p in "$(brew --prefix openssl@3 2>/dev/null)/lib/pkgconfig" \
+                 "$(brew --prefix openssl 2>/dev/null)/lib/pkgconfig"; do
+            if [ -d "$p" ]; then
+                export PKG_CONFIG_PATH="$p:${PKG_CONFIG_PATH:-}"
+                break
+            fi
+        done
+    fi
+    if ! pkg-config --exists libcrypto; then
+        echo "[!] libcrypto pkg-config not found. Run: brew install pkg-config openssl" >&2
+        exit 1
+    fi
+    (cd "$UPSTREAM/Exploits/fastPathSign" && make)
+fi
+
 # 1. Stage our deltas into the upstream tree. Save originals to a sentinel so
 #    we can `git checkout` them back at the end even if we crash midway.
 echo "[*] Staging mxhelper deltas into $UPSTREAM/TrollHelper/"

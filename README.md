@@ -41,13 +41,16 @@ troll/
 
 ### 2. 编 helper（macOS only）
 
-需要 Xcode CLT + Theos：
+需要 Xcode CLT + Theos + Homebrew + pkg-config + openssl + libarchive：
 
 ```bash
+brew install pkg-config openssl libarchive
 export THEOS=~/theos
 cd troll
 make device         # 产出 mxrestore/payload/PersistenceHelper_Embedded
 ```
+
+`make device` 会先用 clang 编一个 host 端的 `fastPathSign`（CoreTrust 假签工具），再用 Theos 编 TrollHelper 本体，然后导出 `PersistenceHelper_Embedded`。
 
 ### 3. 装宿主端依赖
 
