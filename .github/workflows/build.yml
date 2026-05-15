@@ -1,0 +1,97 @@
+name: Build PersistenceHelper_Embedded
+
+# Builds the customized mxhelper binary in a known-good macOS + Xcode 15.x
+# environment. Solves the "user's Xcode 26 clang generates code that crashes
+# on iOS 15.x" problem we hit when building locally on bleeding-edge Macs.
+#
+# Outputs:
+#   - Run artifact (always)
+#   - Auto-commit to mxrestore/payload/PersistenceHelper_Embedded on push to
+#     main (only if mxhelper/ or top-level config changed). Skipped on PRs.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mxhelper/**'
+      - 'third_party/TrollStore/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need full history so we can commit the binary back on the same ref.
+          fetch-depth: 0
+          # Use a token with write so push-back works (default GITHUB_TOKEN is fine
+          # when permissions.contents=write at workflow scope).
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Select Xcode 15.2 (TrollStore-compatible clang)
+        run: |
+          # macos-14 ships several Xcodes. 15.2 matches the era TrollStore
+          # 2.1.1 was released in, so the clang ABI/codegen lines up with
+          # opa334's CI output. Newer Xcodes (16+/26+) emit objc runtime calls
+          # iOS 15.x doesn't have.
+          sudo xcode-select -s /Applications/Xcode_15.2.app || sudo xcode-select -s /Applications/Xcode_15.0.1.app
+          xcodebuild -version
+
+      - name: Install brew dependencies
+        run: |
+          brew install ldid xz pkg-config openssl@3 libarchive
+
+      - name: Install Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git ~/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Install iPhoneOS 16.5 SDK
+        run: |
+          cd ~/theos/sdks
+          curl -fsSL -O https://github.com/theos/sdks/raw/master/iPhoneOS16.5.sdk.tar.xz
+          tar -xf iPhoneOS16.5.sdk.tar.xz
+          rm iPhoneOS16.5.sdk.tar.xz
+          ls -la
+
+      - name: Build mxhelper
+        env:
+          THEOS: /Users/runner/theos
+        run: |
+          ./mxhelper/build.sh
+
+      - name: Inspect output binary
+        run: |
+          ls -la mxrestore/payload/PersistenceHelper_Embedded
+          file   mxrestore/payload/PersistenceHelper_Embedded
+          otool -l mxrestore/payload/PersistenceHelper_Embedded | grep -A 3 LC_BUILD_VERSION
+          # Verify both __DATA sections got embedded.
+          otool -s __DATA __mxconfig mxrestore/payload/PersistenceHelper_Embedded | head -5
+          otool -s __DATA __tstar    mxrestore/payload/PersistenceHelper_Embedded | head -3
+          ldid -e mxrestore/payload/PersistenceHelper_Embedded | head -10
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PersistenceHelper_Embedded
+          path: mxrestore/payload/PersistenceHelper_Embedded
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Commit binary back to repo (push events only)
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet mxrestore/payload/PersistenceHelper_Embedded; then
+            echo "no change to binary, skipping commit"
+            exit 0
+          fi
+          git add mxrestore/payload/PersistenceHelper_Embedded
+          git commit -m "ci: rebuild PersistenceHelper_Embedded [skip ci]"
+          git push origin HEAD:${GITHUB_REF#refs/heads/}

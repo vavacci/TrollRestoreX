@@ -12,8 +12,10 @@ Two differences vs upstream trollstore.py:
 """
 import json
 import platform
+import plistlib
 import sys
 import traceback
+import urllib.parse
 from pathlib import Path
 
 import click
@@ -27,6 +29,39 @@ from pymobiledevice3.services.installation_proxy import InstallationProxyService
 from sparserestore import backup, perform_restore
 
 PAYLOAD_PATH = Path(__file__).resolve().parent / "payload" / "PersistenceHelper_Embedded"
+MXCONFIG_PATH = Path(__file__).resolve().parent.parent / "mxhelper" / "mxconfig.plist"
+
+
+def _read_ipa_url() -> str | None:
+    """Return the IPA URL from mxhelper/mxconfig.plist if set, else None."""
+    if not MXCONFIG_PATH.exists():
+        return None
+    try:
+        with open(MXCONFIG_PATH, "rb") as f:
+            cfg = plistlib.load(f)
+        url = cfg.get("IPAURL") or ""
+        return url.strip() or None
+    except Exception:
+        return None
+
+
+def _print_post_install_url(progress: bool) -> None:
+    """After TrollRestore succeeds, surface the apple-magnifier:// URL that
+    will install the configured target IPA. Works regardless of whether the
+    binary is the CI-built MXAutoFlow version (which would auto-install) or
+    the opa334 fallback (which needs this manual step)."""
+    url = _read_ipa_url()
+    if not url or url.startswith(("https://example.com", "http://example.com")):
+        return
+    install_url = f"apple-magnifier://install?url={urllib.parse.quote(url, safe=':/?&=')}"
+    if progress:
+        _emit(True, stage="post_install_url", url=install_url, ipa_url=url)
+        return
+    click.secho("\n── 装完 TrollStore 后，再做下面这一步装目标应用 ──", fg="cyan", bold=True)
+    click.secho("  iPhone 上 Safari 打开:", fg="cyan")
+    click.secho(f"  {install_url}\n", fg="white")
+    click.secho("  (如果 helper 是 GH Actions 编出来的自动版，这步会自动跑，"
+                "你可以忽略上面的链接。)\n", fg="bright_black")
 
 
 def _emit(progress, **kw):
@@ -174,6 +209,7 @@ def cli(ctx, service_provider: LockdownClient, system_app, no_reboot, json_progr
         _emit(json_progress, _color="green",
               msg="Restore done. Reboot the device manually to activate.",
               stage="restore_done", reboot_required=True)
+        _print_post_install_url(json_progress)
         return
 
     _emit(json_progress, _color="green",
@@ -186,6 +222,7 @@ def cli(ctx, service_provider: LockdownClient, system_app, no_reboot, json_progr
           msg="Reboot triggered. After the device comes back up, tap the swapped system app "
               "icon to start auto-install. Re-enable Find My if you use it.",
           stage="done")
+    _print_post_install_url(json_progress)
 
 
 def main():

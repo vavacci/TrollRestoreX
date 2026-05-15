@@ -39,18 +39,27 @@ troll/
 <string>0123...64位hex</string>      <!-- 可选，留空跳过校验 -->
 ```
 
-### 2. 编 helper（macOS only）
+### 2. 拿到 PersistenceHelper_Embedded（三选一）
 
-需要 Xcode CLT + Theos + Homebrew + pkg-config + openssl + libarchive：
+**A. 用仓库自带的（最简单，已 commit）**
+
+`mxrestore/payload/PersistenceHelper_Embedded` 是 opa334 官方 release 的 2.1.1 版，arm64 + modern CT 签名，已经验证在 iOS 15.2–17.0 都能正常启动。装 IPA 那一步走「mxrestore.py 跑完打印 `apple-magnifier://install?url=…`、在 Safari 里打开一次」的兜底路径。**不需要任何 macOS 编译环境**。
+
+**B. 让 GitHub Actions 在云上编（推荐用于一键流）**
+
+如果你想要「点一次 Tips 自动装完所有东西」的体验（mxconfig.plist 的 URL 烤进二进制、helper 启动自动装 IPA），编辑 `mxhelper/mxconfig.plist`、push 到 main，[Actions](../../actions/workflows/build.yml) 会用 macos-14 runner + Xcode 15.2 + Theos 编一份带 `__DATA,__mxconfig` / `__DATA,__tstar` 段的二进制，**直接 commit 回 `mxrestore/payload/`**，你 `git pull` 一下就能用。
+
+为什么不用本地 macOS 编：Xcode 16+ / 26 的 clang 给 iOS 15.x 这种老目标生成的 objc runtime 调用（selector stubs / 相对方法表）在老 runtime 上跑不了，编出来 helper 启动就 dyld 拒绝。CI 锁死 Xcode 15.2 + iPhoneOS16.5.sdk 就稳了。
+
+**C. 本地编（适合你 Mac 装了 Xcode 15.x 的情况）**
 
 ```bash
 brew install pkg-config openssl libarchive
 export THEOS=~/theos
-cd troll
 make device         # 产出 mxrestore/payload/PersistenceHelper_Embedded
 ```
 
-`make device` 会先用 clang 编一个 host 端的 `fastPathSign`（CoreTrust 假签工具），再用 Theos 编 TrollHelper 本体，然后导出 `PersistenceHelper_Embedded`。
+`make device` 会编 `fastPathSign`，splice MXAutoFlow.{h,m} + TSHRootViewController.m + mxconfig.plist + TrollStore.tar 进 upstream，加上 `-Wl,-sectcreate` 把后两个文件烤进二进制 `__DATA` 段，Theos 出 binary，导出到 payload。如果你 Mac 上 Xcode 太新（17/18/26）这一步会编出能编但启动闪退的二进制，请回到 A 或 B。
 
 ### 3. 装宿主端依赖
 

@@ -44,18 +44,17 @@ fi
 # 1. Stage our deltas into the upstream tree.
 #    MX_VANILLA=1 skips all of our injections and builds an upstream-equivalent
 #    binary — useful as an A/B test when debugging launch issues.
-# Always snapshot the upstream TSHRootViewController.m before we touch it, so
-# we can restore it in step 4 even if the build crashes midway (third_party is
-# vendored as flat files, no `git checkout` recovery).
+# Snapshot upstream files we're about to overwrite (third_party is flat-vendored,
+# no `git checkout` recovery is possible).
 ORIG_TSHRVC="$UPSTREAM/TrollHelper/TSHRootViewController.m.mxorig"
-if [ ! -f "$ORIG_TSHRVC" ]; then
-    cp "$UPSTREAM/TrollHelper/TSHRootViewController.m" "$ORIG_TSHRVC"
-fi
+ORIG_MK="$UPSTREAM/TrollHelper/Makefile.mxorig"
+[ -f "$ORIG_TSHRVC" ] || cp "$UPSTREAM/TrollHelper/TSHRootViewController.m" "$ORIG_TSHRVC"
+[ -f "$ORIG_MK" ]     || cp "$UPSTREAM/TrollHelper/Makefile"                "$ORIG_MK"
 
 if [ "${MX_VANILLA:-0}" = "1" ]; then
     echo "[*] MX_VANILLA=1 → skipping mxhelper deltas (building upstream-equivalent)"
-    # Make sure the upstream controller is in place.
     cp "$ORIG_TSHRVC" "$UPSTREAM/TrollHelper/TSHRootViewController.m"
+    cp "$ORIG_MK"     "$UPSTREAM/TrollHelper/Makefile"
 else
     echo "[*] Staging mxhelper deltas into $UPSTREAM/TrollHelper/"
     cp "$HERE/MXAutoFlow.h"             "$UPSTREAM/TrollHelper/MXAutoFlow.h"
@@ -63,6 +62,23 @@ else
     cp "$HERE/TSHRootViewController.m"  "$UPSTREAM/TrollHelper/TSHRootViewController.m"
     cp "$HERE/mxconfig.plist"           "$UPSTREAM/TrollHelper/Resources/mxconfig.plist"
     cp "$HERE/Resources/TrollStore.tar" "$UPSTREAM/TrollHelper/Resources/TrollStore.tar"
+
+    # Patch Makefile: insert -Wl,-sectcreate LDFLAGS before the application.mk
+    # include, so mxconfig.plist + TrollStore.tar get baked into the binary as
+    # __DATA,__mxconfig / __DATA,__tstar sections. Runtime reads them via
+    # getsectiondata() in MXAutoFlow.m — no separate file injection needed.
+    cp "$ORIG_MK" "$UPSTREAM/TrollHelper/Makefile"
+    python3 - <<PYEOF
+import pathlib
+p = pathlib.Path("$UPSTREAM/TrollHelper/Makefile")
+content = p.read_text()
+marker = "include \$(THEOS_MAKE_PATH)/application.mk"
+inject = ("# mxhelper: embed mxconfig.plist + TrollStore.tar as __DATA sections\n"
+          "TrollStorePersistenceHelper_LDFLAGS += -Wl,-sectcreate,__DATA,__mxconfig,Resources/mxconfig.plist\n"
+          "TrollStorePersistenceHelper_LDFLAGS += -Wl,-sectcreate,__DATA,__tstar,Resources/TrollStore.tar\n\n")
+assert marker in content, "Makefile layout changed upstream; rework insertion marker"
+p.write_text(content.replace(marker, inject + marker, 1))
+PYEOF
 fi
 
 # 2. Run the existing TrollHelper Theos build with EMBEDDED_ROOT_HELPER=1.
@@ -90,8 +106,7 @@ rm -f "$UPSTREAM/TrollHelper/MXAutoFlow.h" \
       "$UPSTREAM/TrollHelper/MXAutoFlow.m" \
       "$UPSTREAM/TrollHelper/Resources/mxconfig.plist" \
       "$UPSTREAM/TrollHelper/Resources/TrollStore.tar"
-# Restore upstream TSHRootViewController.m from our snapshot.
-if [ -f "$ORIG_TSHRVC" ]; then
-    cp "$ORIG_TSHRVC" "$UPSTREAM/TrollHelper/TSHRootViewController.m"
-fi
+# Restore upstream files from our snapshots.
+[ -f "$ORIG_TSHRVC" ] && cp "$ORIG_TSHRVC" "$UPSTREAM/TrollHelper/TSHRootViewController.m"
+[ -f "$ORIG_MK" ]     && cp "$ORIG_MK"     "$UPSTREAM/TrollHelper/Makefile"
 (cd "$UPSTREAM/TrollHelper" && make clean >/dev/null || true)

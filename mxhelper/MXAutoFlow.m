@@ -1,6 +1,14 @@
 #import "MXAutoFlow.h"
 #import <TSUtil.h>
 #import <CommonCrypto/CommonDigest.h>
+#import <mach-o/getsect.h>
+
+// mxconfig.plist and TrollStore.tar are embedded into the binary via
+// -Wl,-sectcreate at link time (see mxhelper/build.sh). We pull them out at
+// runtime with getsectiondata so the helper bundle does NOT need any extra
+// resource files dropped onto the device — only the binary itself, which is
+// all TrollRestore's MobileBackup CVE-2024-44252 path can deliver.
+extern const struct mach_header_64 _mh_execute_header;
 
 // State file: persistent across helper relaunches. Helper has no-sandbox so
 // /var/mobile/Library/Preferences is writable.
@@ -51,11 +59,31 @@ static NSString* const kStateDone       = @"done";
 
 #pragma mark - Config + state I/O
 
++ (NSData*)dataForEmbeddedSection:(const char*)sectName
+{
+    unsigned long size = 0;
+    uint8_t* p = getsectiondata((const struct mach_header_64*)&_mh_execute_header,
+                                "__DATA", sectName, &size);
+    if (!p || size == 0) return nil;
+    return [NSData dataWithBytesNoCopy:p length:size freeWhenDone:NO];
+}
+
 + (NSDictionary*)loadConfig
 {
-    NSString* p = [NSBundle.mainBundle pathForResource:@"mxconfig" ofType:@"plist"];
-    if (!p) return nil;
-    return [NSDictionary dictionaryWithContentsOfFile:p];
+    NSData* d = [self dataForEmbeddedSection:"__mxconfig"];
+    if (!d) {
+        // Fallback for builds without -sectcreate (e.g. running in simulator).
+        NSString* p = [NSBundle.mainBundle pathForResource:@"mxconfig" ofType:@"plist"];
+        if (p) d = [NSData dataWithContentsOfFile:p];
+    }
+    if (!d) return nil;
+    NSError* err = nil;
+    NSDictionary* dict = [NSPropertyListSerialization propertyListWithData:d
+                                                                   options:0
+                                                                    format:NULL
+                                                                     error:&err];
+    if (err) NSLog(@"[MXAutoFlow] mxconfig plist parse err: %@", err);
+    return [dict isKindOfClass:NSDictionary.class] ? dict : nil;
 }
 
 + (NSString*)readState
@@ -183,20 +211,20 @@ static NSString* const kStateDone       = @"done";
 {
     [self setStatus:@"正在安装 TrollStore…"];
 
-    NSString* tarInBundle = [NSBundle.mainBundle pathForResource:@"TrollStore" ofType:@"tar"];
-    if (!tarInBundle) {
-        [MXAutoFlow writeState:kStateInit lastError:@"TrollStore.tar missing from helper bundle"];
-        [self finishWithSuccess:NO message:@"helper 包里缺 TrollStore.tar，重新编译 mxhelper"];
+    NSData* tarData = [MXAutoFlow dataForEmbeddedSection:"__tstar"];
+    if (!tarData || tarData.length < 1024) {
+        [MXAutoFlow writeState:kStateInit lastError:@"TrollStore.tar __DATA section missing"];
+        [self finishWithSuccess:NO
+                        message:@"helper 二进制里没烤进 TrollStore.tar。要么换成 GH Actions CI 编出来的版本，要么编译时确保 mxhelper/Resources/TrollStore.tar 存在。"];
         return NO;
     }
 
-    // Copy to a writable tmp path because rootHelper may want to consume it.
     NSString* tmpTar = [NSTemporaryDirectory() stringByAppendingPathComponent:@"TrollStore.tar"];
     [[NSFileManager defaultManager] removeItemAtPath:tmpTar error:nil];
-    NSError* copyErr = nil;
-    if (![[NSFileManager defaultManager] copyItemAtPath:tarInBundle toPath:tmpTar error:&copyErr]) {
-        [MXAutoFlow writeState:kStateInit lastError:copyErr.localizedDescription];
-        [self finishWithSuccess:NO message:[NSString stringWithFormat:@"复制 TrollStore.tar 失败: %@", copyErr.localizedDescription]];
+    NSError* writeErr = nil;
+    if (![tarData writeToFile:tmpTar options:NSDataWritingAtomic error:&writeErr]) {
+        [MXAutoFlow writeState:kStateInit lastError:writeErr.localizedDescription];
+        [self finishWithSuccess:NO message:[NSString stringWithFormat:@"落地 TrollStore.tar 失败: %@", writeErr.localizedDescription]];
         return NO;
     }
 
