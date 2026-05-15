@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 必填：目标 IPA 的下载地址。helper 首启会下载这个 URL 并装上去。 -->
+    <key>IPAURL</key>
+    <string>https://example.com/replace-me/yourapp.ipa</string>
+
+    <!-- 可选：SHA256 校验。填 64 位十六进制；留空字符串 = 跳过校验。
+         强烈建议至少首次发布时 pin 一个，避免 CDN 返回错误页时装垃圾。 -->
+    <key>IPASHA256</key>
+    <string></string>
+
+    <!-- 可选：仅用于装完后查应用是否在 LSApplicationProxy 里登记成功。
+         不填也没事，IPA 装的时候不需要这个字段。 -->
+    <key>IPABundleID</key>
+    <string></string>
+</dict>
+</plist>

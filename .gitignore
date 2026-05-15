@@ -1,0 +1,14 @@
+# Build artifacts
+mxrestore/payload/PersistenceHelper_Embedded
+mxhelper/.theos/
+**/.DS_Store
+__pycache__/
+*.pyc
+
+# Theos build artifacts that may leak into the upstream tree if a previous
+# build crashed mid-stage; safe to ignore.
+third_party/TrollStore/TrollHelper/.theos/
+third_party/TrollStore/TrollHelper/MXAutoFlow.h
+third_party/TrollStore/TrollHelper/MXAutoFlow.m
+third_party/TrollStore/TrollHelper/Resources/mxconfig.plist
+third_party/TrollStore/TrollHelper/Resources/TrollStore.tar
