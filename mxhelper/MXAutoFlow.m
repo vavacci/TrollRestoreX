@@ -572,12 +572,17 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
         MXStatusVC* vc = [[MXStatusVC alloc] init];
         vc.apps = self.apps;
         vc.state = [NSDictionary dictionaryWithContentsOfFile:kMXStateFile] ?: @{};
-        __weak typeof(self) weakSelf = self;
+        // Capture self STRONGLY: the flow object is only retained by the
+        // local `flow` var inside +runOnceWithViewController:, which goes out
+        // of scope as soon as that method returns. Without a strong block
+        // capture, the MXAutoFlow instance gets dealloc'd before the user
+        // ever taps a button, and the callbacks become no-ops on nil. No
+        // retain cycle: MXAutoFlow doesn't reference back to the sheet.
         vc.onReinstallApp = ^(NSDictionary* app) {
-            [weakSelf forceReinstallApp:app];
+            [self forceReinstallApp:app];
         };
         vc.onRerunAll = ^{
-            [weakSelf kickoff];
+            [self kickoff];
         };
         UINavigationController* nav = [[UINavigationController alloc] initWithRootViewController:vc];
         nav.modalPresentationStyle = UIModalPresentationFormSheet;
