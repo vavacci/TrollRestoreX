@@ -42,6 +42,16 @@ PyInstaller automatically ad-hoc signs every Mach-O inside the bundle
 (`codesign -s -`), which is **all Apple Silicon needs to launch the binary**.
 No Developer ID required.
 
+#### Why `PersistenceHelper_Embedded` is shipped as `.gz`
+
+The .spec gzips the helper payload at build time. Without that, PyInstaller's
+Mach-O auto-classifier treats the file as a "binary" and tries to ad-hoc
+codesign it. macOS `codesign` then errors out with
+`internal error in Code Signing subsystem` because the file already carries
+TrollStore's CoreTrust-bypass fakesign — a layout `codesign` doesn't
+understand. Renaming to `.gz` skips the classifier, and `mxrestore_gui.py`
+decompresses in memory at use-site.
+
 ### Distributing it (the easy way — what everyone in the community does)
 
 Just send `dist/mxrestore-gui.app` to whoever needs it (zip it first, AirDrop

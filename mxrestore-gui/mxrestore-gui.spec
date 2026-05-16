@@ -15,15 +15,30 @@ We bundle:
 so this .app stays in sync with the CLI without copying files at git level.
 """
 from pathlib import Path
+import gzip
 import platform
+import tempfile
 
 HERE = Path(SPECPATH).resolve()
 ROOT = HERE.parent
 MXRESTORE = ROOT / "mxrestore"
 MXHELPER = ROOT / "mxhelper"
 
+# Gzip the helper at build time. Otherwise PyInstaller's auto-classifier sees
+# the Mach-O magic bytes, treats it as a "binary" rather than data, and tries
+# to ad-hoc codesign it (`codesign -s -`). That fails with
+#   "internal error in Code Signing subsystem"
+# because the file already carries TrollStore's CoreTrust-bypass fakesign,
+# which macOS codesign does not understand. The .gz extension hides it.
+HELPER_SRC = MXRESTORE / "payload" / "PersistenceHelper_Embedded"
+HELPER_GZ_DIR = Path(tempfile.gettempdir()) / "mxrestore-gui-build"
+HELPER_GZ_DIR.mkdir(parents=True, exist_ok=True)
+HELPER_GZ = HELPER_GZ_DIR / "PersistenceHelper_Embedded.gz"
+with open(HELPER_SRC, "rb") as _fi, gzip.open(HELPER_GZ, "wb") as _fo:
+    _fo.write(_fi.read())
+
 datas = [
-    (str(MXRESTORE / "payload" / "PersistenceHelper_Embedded"), "payload"),
+    (str(HELPER_GZ), "payload"),
     (str(MXHELPER / "mxconfig.plist"), "."),
 ]
 # Bundle sparserestore as a real package next to the entry script so the

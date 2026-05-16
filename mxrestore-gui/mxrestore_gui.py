@@ -14,6 +14,7 @@ Stripped from seregonwar's upstream GUI:
   - Network fetch of PersistenceHelper_Embedded (we ship our own)
   - User-app list (we overwrite SYSTEM apps like Tips)
 """
+import gzip
 import os
 import platform
 import plistlib
@@ -26,20 +27,28 @@ from pathlib import Path
 from tkinter import StringVar, SUNKEN
 
 # Resolve paths whether running in source tree or frozen by PyInstaller.
-# In dev:  mxrestore-gui/  →  ../mxrestore/{sparserestore,payload}, ../mxhelper/mxconfig.plist
-# Frozen:  PyInstaller drops sparserestore as a real package, and bundles
-#          mxconfig.plist + PersistenceHelper_Embedded next to the binary
-#          via the .spec datas= list (keys: payload/PersistenceHelper_Embedded,
-#          mxconfig.plist).
+# In dev: read raw helper from ../mxrestore/payload/.
+# Frozen: read PersistenceHelper_Embedded.gz (the .spec gzips it at build
+# time so PyInstaller's auto-classifier doesn't try to ad-hoc codesign the
+# iOS CoreTrust-bypass binary, which macOS codesign refuses).
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys._MEIPASS)
-    PAYLOAD_PATH = BASE_DIR / "payload" / "PersistenceHelper_Embedded"
+    PAYLOAD_PATH = BASE_DIR / "payload" / "PersistenceHelper_Embedded.gz"
     MXCONFIG_PATH = BASE_DIR / "mxconfig.plist"
 else:
     HERE = Path(__file__).resolve().parent
     sys.path.insert(0, str(HERE.parent / "mxrestore"))
     PAYLOAD_PATH = HERE.parent / "mxrestore" / "payload" / "PersistenceHelper_Embedded"
     MXCONFIG_PATH = HERE.parent / "mxhelper" / "mxconfig.plist"
+
+
+def load_helper_payload() -> bytes:
+    if not PAYLOAD_PATH.exists():
+        raise RuntimeError(f"Payload missing: {PAYLOAD_PATH}\nBuild mxhelper first.")
+    data = PAYLOAD_PATH.read_bytes()
+    if PAYLOAD_PATH.suffix == ".gz":
+        data = gzip.decompress(data)
+    return data
 
 from packaging.version import parse as parse_version
 from pymobiledevice3.exceptions import NoDeviceConnectedError, PyMobileDevice3Exception
@@ -117,9 +126,7 @@ def install_flow(system_app: str, do_reboot: bool, log):
             "Window is iOS 15.0–16.7 RC (20H18) and 17.0 only."
         )
 
-    if not PAYLOAD_PATH.exists():
-        raise RuntimeError(f"Payload missing: {PAYLOAD_PATH}\nBuild mxhelper first.")
-    helper_contents = PAYLOAD_PATH.read_bytes()
+    helper_contents = load_helper_payload()
 
     if not system_app.endswith(".app"):
         system_app = system_app + ".app"
