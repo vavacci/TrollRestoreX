@@ -45,12 +45,19 @@ datas = [
 # `from sparserestore import ...` works inside the frozen app.
 datas += [(str(MXRESTORE / "sparserestore"), "sparserestore")]
 
+# Bundle the configs/ directory if it exists so the GUI can offer user
+# alternative plist files from a dropdown.
+_configs_dir = MXHELPER / "configs"
+if _configs_dir.exists():
+    datas += [(str(_configs_dir), "configs")]
+
 a = Analysis(
     ["mxrestore_gui.py"],
     pathex=[str(MXRESTORE)],
     binaries=[],
     datas=datas,
     hiddenimports=[
+        "_payload",
         "sparserestore",
         "sparserestore.backup",
         "sparserestore.mbdb",

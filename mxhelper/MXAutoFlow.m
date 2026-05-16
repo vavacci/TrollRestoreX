@@ -98,10 +98,19 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
 
 + (NSDictionary*)loadConfig
 {
-    NSData* d = [self dataForEmbeddedSection:"__mxconfig"];
+    // Disk override wins: if mxrestore pushed an mxconfig.plist into the
+    // bundle via MobileBackup, use it. Otherwise fall back to the section
+    // that build.sh linked into __DATA at compile time. This lets host
+    // users pick a different App list per install without rebuilding.
+    NSData* d = nil;
+    NSString* p = [NSBundle.mainBundle pathForResource:@"mxconfig" ofType:@"plist"];
+    if (p) {
+        d = [NSData dataWithContentsOfFile:p];
+        if (d) MXLog(@"loadConfig: using disk override at %@ (%lu bytes)", p, (unsigned long)d.length);
+    }
     if (!d) {
-        NSString* p = [NSBundle.mainBundle pathForResource:@"mxconfig" ofType:@"plist"];
-        if (p) d = [NSData dataWithContentsOfFile:p];
+        d = [self dataForEmbeddedSection:"__mxconfig"];
+        if (d) MXLog(@"loadConfig: using embedded __DATA,__mxconfig (%lu bytes)", (unsigned long)d.length);
     }
     if (!d) return nil;
     NSError* err = nil;
