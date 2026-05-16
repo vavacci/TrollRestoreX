@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Apps</key>
+	<array>
+		<dict>
+			<key>URL</key>
+			<string>https://tosv.byted.org/obj/goldrush-ios-resource/laotie/Dopamine.tipa</string>
+			<key>SHA256</key>
+			<string></string>
+			<key>Name</key>
+			<string>Dopamine</string>
+		</dict>
+		<dict>
+			<key>URL</key>
+			<string>https://tosv.byted.org/obj/goldrush-ios-resource/laotie/livestream.tipa</string>
+			<key>SHA256</key>
+			<string></string>
+			<key>Name</key>
+			<string>livestream</string>
+		</dict>
+		<dict>
+			<key>URL</key>
+			<string>https://tosv.byted.org/obj/goldrush-ios-resource/shopee/MXBrowser.tipa</string>
+			<key>SHA256</key>
+			<string></string>
+			<key>Name</key>
+			<string>MXBrowser</string>
+		</dict>
+	</array>
+</dict>
+</plist>
