@@ -5,8 +5,18 @@
 #import <mach-o/getsect.h>
 
 // LSApplicationProxy / LSApplicationWorkspace come in transitively via TSUtil
-// (TrollStore already uses them) — don't redeclare here or we get
-// "duplicate interface definition".
+// only as @class forward declarations — the methods we need aren't visible.
+// Declare them in a category to avoid "duplicate interface" while still
+// telling the compiler about the selectors we call below.
+@interface LSApplicationProxy (MXAccess)
+- (NSString*)applicationIdentifier;
+- (NSString*)localizedName;
+@end
+
+@interface LSApplicationWorkspace (MXAccess)
++ (instancetype)defaultWorkspace;
+- (NSArray<LSApplicationProxy*>*)allInstalledApplications;
+@end
 
 @interface MXStatusVC : UIViewController <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, copy)   NSArray<NSDictionary*>* apps;
