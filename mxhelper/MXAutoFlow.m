@@ -9,8 +9,10 @@
 // Declare them in a category to avoid "duplicate interface" while still
 // telling the compiler about the selectors we call below.
 @interface LSApplicationProxy (MXAccess)
++ (instancetype)applicationProxyForIdentifier:(NSString*)bid;
 - (NSString*)applicationIdentifier;
 - (NSString*)localizedName;
+- (NSURL*)bundleURL;
 @end
 
 @interface LSApplicationWorkspace (MXAccess)
@@ -21,7 +23,6 @@
 @interface MXStatusVC : UIViewController <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, copy)   NSArray<NSDictionary*>* apps;
 @property (nonatomic, copy)   NSDictionary*           state;
-@property (nonatomic, copy)   NSSet<NSString*>*       installedBidSet;  // snapshot of device's current bundle IDs
 @property (nonatomic, copy)   void(^onReinstallApp)(NSDictionary*);
 @property (nonatomic, copy)   void(^onRerunAll)(void);
 @end
@@ -294,6 +295,32 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
     }
 }
 
+// Authoritative installed-check: even when installd's database hasn't
+// purged a deleted TrollStore app's bid, the .app directory itself is
+// gone from disk. Trust the filesystem.
++ (BOOL)isAppOnDevice:(NSString*)bid
+{
+    if (!bid.length) return NO;
+    @try {
+        LSApplicationProxy* p = [LSApplicationProxy applicationProxyForIdentifier:bid];
+        if (!p) {
+            MXLog(@"isAppOnDevice: no proxy for %@", bid);
+            return NO;
+        }
+        NSURL* url = [p bundleURL];
+        if (!url) {
+            MXLog(@"isAppOnDevice: no bundleURL for %@", bid);
+            return NO;
+        }
+        BOOL exists = [[NSFileManager defaultManager] fileExistsAtPath:url.path];
+        MXLog(@"isAppOnDevice: %@ → %@ exists=%d", bid, url.path, exists);
+        return exists;
+    } @catch (NSException* e) {
+        MXLog(@"isAppOnDevice exception for %@: %@", bid, e);
+        return NO;
+    }
+}
+
 + (void)recordBundleID:(NSString*)bid forAppURL:(NSString*)url
 {
     if (!bid.length || !url.length) return;
@@ -322,13 +349,12 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
 // 重跑 button actually re-install manually-deleted apps.
 + (void)reconcileStateWithDevice:(NSArray<NSDictionary*>*)apps
 {
-    NSSet* deviceBids = [self allInstalledBundleIDs];
     for (NSDictionary* app in apps) {
         NSString* url = app[@"URL"];
         if (![self isAppURLInstalled:url]) continue;
         NSString* bid = [self bundleIDForAppURL:url];
         if (!bid.length) continue;  // no bid known → can't verify, leave alone
-        if (![deviceBids containsObject:bid]) {
+        if (![self isAppOnDevice:bid]) {
             MXLog(@"reconcile: %@ marked installed but bid %@ not on device, clearing", url, bid);
             [self markAppURLNotInstalled:url];
         }
@@ -719,7 +745,8 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
         MXStatusVC* vc = [[MXStatusVC alloc] init];
         vc.apps = self.apps;
         vc.state = [NSDictionary dictionaryWithContentsOfFile:kMXStateFile] ?: @{};
-        vc.installedBidSet = [MXAutoFlow allInstalledBundleIDs];
+        // Cell renderer checks per-row via isAppOnDevice (disk truth), so no
+        // bid-set snapshot needed.
         // Capture self STRONGLY: the flow object is only retained by the
         // local `flow` var inside +runOnceWithViewController:, which goes out
         // of scope as soon as that method returns. Without a strong block
@@ -821,10 +848,13 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
                                 ? bids[url] : nil;
 
     // Three-way installed check: trust state UNLESS we have a stored bid and
-    // the device doesn't currently have it (= user manually deleted).
+    // the .app directory is gone from disk (= user manually deleted).
+    // We can't rely on LSApplicationWorkspace bid membership alone because
+    // installd's database keeps stale entries for TrollStore apps deleted
+    // from the home screen — the on-disk bundle is the source of truth.
     BOOL deletedOnDevice = NO;
     if (stateThinksInstalled && knownBid.length) {
-        if (![self.installedBidSet containsObject:knownBid]) {
+        if (![MXAutoFlow isAppOnDevice:knownBid]) {
             deletedOnDevice = YES;
         }
     }
