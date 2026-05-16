@@ -600,15 +600,12 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
 {
     [super viewDidLoad];
     self.title = @"自动安装状态";
-    if (@available(iOS 13.0, *)) {
-        self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
-    } else {
-        self.view.backgroundColor = UIColor.groupTableViewBackgroundColor;
-    }
+    // Whole helper only runs on iOS 15.0–17.0 (mxrestore gates the host
+    // side), so iOS 13+ APIs are always available — no fallback branches.
+    self.view.backgroundColor = UIColor.systemGroupedBackgroundColor;
 
-    UITableViewStyle style = UITableViewStyleGrouped;
-    if (@available(iOS 13.0, *)) style = UITableViewStyleInsetGrouped;
-    self.table = [[UITableView alloc] initWithFrame:self.view.bounds style:style];
+    self.table = [[UITableView alloc] initWithFrame:self.view.bounds
+                                              style:UITableViewStyleInsetGrouped];
     self.table.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     self.table.dataSource = self;
     self.table.delegate = self;
@@ -670,13 +667,13 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
     cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
     if (isInstalled) {
         cell.detailTextLabel.text = @"✅ 已安装";
-        if (@available(iOS 13.0, *)) cell.detailTextLabel.textColor = UIColor.systemGreenColor;
+        cell.detailTextLabel.textColor = UIColor.systemGreenColor;
     } else if (err.length) {
         cell.detailTextLabel.text = [NSString stringWithFormat:@"❌ 失败: %@", err];
-        if (@available(iOS 13.0, *)) cell.detailTextLabel.textColor = UIColor.systemRedColor;
+        cell.detailTextLabel.textColor = UIColor.systemRedColor;
     } else {
         cell.detailTextLabel.text = @"⏳ 待安装";
-        if (@available(iOS 13.0, *)) cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
+        cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
     }
 
     UIButton* btn = [UIButton buttonWithType:UIButtonTypeSystem];
