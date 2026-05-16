@@ -4,9 +4,22 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <mach-o/getsect.h>
 
+// Forward-declared private API. TrollStore-context binaries have the
+// entitlements to call this — that's how trollstorehelper enumerates apps too.
+@interface LSApplicationProxy : NSObject
+@property (nonatomic, readonly) NSString* applicationIdentifier;
+@property (nonatomic, readonly) NSString* localizedName;
+@end
+
+@interface LSApplicationWorkspace : NSObject
++ (instancetype)defaultWorkspace;
+- (NSArray<LSApplicationProxy*>*)allInstalledApplications;
+@end
+
 @interface MXStatusVC : UIViewController <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, copy)   NSArray<NSDictionary*>* apps;
 @property (nonatomic, copy)   NSDictionary*           state;
+@property (nonatomic, copy)   NSSet<NSString*>*       installedBidSet;  // snapshot of device's current bundle IDs
 @property (nonatomic, copy)   void(^onReinstallApp)(NSDictionary*);
 @property (nonatomic, copy)   void(^onRerunAll)(void);
 @end
@@ -260,6 +273,108 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
     return pending;
 }
 
+#pragma mark - Bundle ID tracking (so status sheet can detect manual deletion)
+
++ (NSSet<NSString*>*)allInstalledBundleIDs
+{
+    @try {
+        LSApplicationWorkspace* ws = [LSApplicationWorkspace defaultWorkspace];
+        NSArray<LSApplicationProxy*>* apps = [ws allInstalledApplications];
+        NSMutableSet* bids = [NSMutableSet setWithCapacity:apps.count];
+        for (LSApplicationProxy* app in apps) {
+            NSString* bid = app.applicationIdentifier;
+            if (bid.length) [bids addObject:bid];
+        }
+        return bids;
+    } @catch (NSException* e) {
+        MXLog(@"allInstalledBundleIDs threw: %@", e);
+        return [NSSet set];
+    }
+}
+
++ (void)recordBundleID:(NSString*)bid forAppURL:(NSString*)url
+{
+    if (!bid.length || !url.length) return;
+    NSMutableDictionary* state = [self readStateMutable];
+    NSMutableDictionary* bids = [state[@"app_bundle_ids"] mutableCopy] ?: [NSMutableDictionary dictionary];
+    bids[url] = bid;
+    state[@"app_bundle_ids"] = bids;
+    [self writeState:state];
+}
+
++ (NSString*)bundleIDForAppURL:(NSString*)url
+{
+    NSDictionary* state = [NSDictionary dictionaryWithContentsOfFile:kMXStateFile];
+    NSDictionary* bids = state[@"app_bundle_ids"];
+    if (![bids isKindOfClass:NSDictionary.class]) return nil;
+    id v = bids[url];
+    return [v isKindOfClass:NSString.class] ? v : nil;
+}
+
+// Best-effort recovery for state predating bid tracking: for each app marked
+// installed without a stored bid, look for an installed app whose display
+// name matches the URL filename (e.g. ".../livestream.tipa" → "livestream").
+// Only stores a match on UNIQUE hits to avoid pinning the wrong bid.
+// For each app marked installed in state whose stored bid is NOT in the
+// device's current bundle ID set: clear the installed flag. This makes the
+// 重跑 button actually re-install manually-deleted apps.
++ (void)reconcileStateWithDevice:(NSArray<NSDictionary*>*)apps
+{
+    NSSet* deviceBids = [self allInstalledBundleIDs];
+    for (NSDictionary* app in apps) {
+        NSString* url = app[@"URL"];
+        if (![self isAppURLInstalled:url]) continue;
+        NSString* bid = [self bundleIDForAppURL:url];
+        if (!bid.length) continue;  // no bid known → can't verify, leave alone
+        if (![deviceBids containsObject:bid]) {
+            MXLog(@"reconcile: %@ marked installed but bid %@ not on device, clearing", url, bid);
+            [self markAppURLNotInstalled:url];
+        }
+    }
+}
+
++ (void)backfillBundleIDsForApps:(NSArray<NSDictionary*>*)apps
+{
+    NSDictionary* state = [NSDictionary dictionaryWithContentsOfFile:kMXStateFile];
+    NSDictionary* installed = state[@"installed_apps"];
+    NSDictionary* knownBids = state[@"app_bundle_ids"];
+
+    NSArray<LSApplicationProxy*>* allApps = nil;
+    @try {
+        allApps = [[LSApplicationWorkspace defaultWorkspace] allInstalledApplications];
+    } @catch (NSException* e) {
+        MXLog(@"backfill: failed to enumerate apps: %@", e);
+        return;
+    }
+
+    for (NSDictionary* app in apps) {
+        NSString* url = app[@"URL"];
+        if (![installed[url] boolValue]) continue;
+        if ([knownBids[url] isKindOfClass:NSString.class]) continue;
+
+        NSString* fname = [[url.lastPathComponent stringByDeletingPathExtension] lowercaseString];
+        if (!fname.length) continue;
+
+        NSString* matchedBid = nil;
+        int matches = 0;
+        for (LSApplicationProxy* p in allApps) {
+            NSString* disp = [p.localizedName lowercaseString];
+            if (!disp.length) continue;
+            if ([disp isEqualToString:fname] || [disp containsString:fname] || [fname containsString:disp]) {
+                matchedBid = p.applicationIdentifier;
+                matches++;
+                if (matches > 1) break;
+            }
+        }
+        if (matches == 1 && matchedBid.length) {
+            [self recordBundleID:matchedBid forAppURL:url];
+            MXLog(@"backfill: matched %@ → %@ by name '%@'", url, matchedBid, fname);
+        } else if (matches > 1) {
+            MXLog(@"backfill: skip %@ — ambiguous (%d name matches for '%@')", url, matches, fname);
+        }
+    }
+}
+
 #pragma mark - HUD wrappers
 // Use upstream's TSPresentationDelegate so the native PSListController stays
 // visible underneath the modal HUD.
@@ -312,8 +427,11 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
 
 - (void)kickoff
 {
-    // Re-run with the full configured app list; state machine still skips
-    // ones already marked installed (idempotent).
+    // Re-run with the full configured app list. Reconcile first so the
+    // state machine reinstalls anything the user manually deleted (state
+    // says installed but device doesn't have the bid).
+    [MXAutoFlow backfillBundleIDsForApps:self.apps];
+    [MXAutoFlow reconcileStateWithDevice:self.apps];
     [self kickoffForAppsToInstall:self.apps];
 }
 
@@ -468,6 +586,11 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
         return NO;
     }
 
+    // Snapshot installed bundle IDs before we run trollstorehelper; we'll
+    // diff after to learn the new bid (so the status sheet can later detect
+    // if the user manually deleted this app).
+    NSSet* bidsBefore = [MXAutoFlow allInstalledBundleIDs];
+
     NSDate* installStart = NSDate.date;
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 2*NSEC_PER_SEC, 100*NSEC_PER_MSEC);
@@ -495,6 +618,24 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
         [MXAutoFlow recordError:shortErr forApp:url];
         return NO;
     }
+
+    // Diff to find the new bundle ID. Single-new = unambiguous match.
+    // Zero-new = reinstall over an existing copy (already known bid stays).
+    // Multi-new = something else also got installed in this window
+    //   (vanishingly unlikely since the state machine is serial) — log + skip.
+    NSMutableSet* bidsAfter = [[MXAutoFlow allInstalledBundleIDs] mutableCopy];
+    [bidsAfter minusSet:bidsBefore];
+    if (bidsAfter.count == 1) {
+        NSString* newBid = bidsAfter.anyObject;
+        [MXAutoFlow recordBundleID:newBid forAppURL:url];
+        MXLog(@"detected bid %@ for %@", newBid, name);
+    } else if (bidsAfter.count == 0) {
+        MXLog(@"no new bid after install of %@ (likely reinstalled over existing copy)", name);
+    } else {
+        MXLog(@"WARN: %lu new bids after installing %@: %@",
+              (unsigned long)bidsAfter.count, name, bidsAfter);
+    }
+
     return YES;
 }
 
@@ -569,9 +710,14 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
             return;
         }
 
+        // Best-effort: try to fill in bundle IDs for any state entries that
+        // predate bid tracking (so we can detect manual deletion for them too).
+        [MXAutoFlow backfillBundleIDsForApps:self.apps];
+
         MXStatusVC* vc = [[MXStatusVC alloc] init];
         vc.apps = self.apps;
         vc.state = [NSDictionary dictionaryWithContentsOfFile:kMXStateFile] ?: @{};
+        vc.installedBidSet = [MXAutoFlow allInstalledBundleIDs];
         // Capture self STRONGLY: the flow object is only retained by the
         // local `flow` var inside +runOnceWithViewController:, which goes out
         // of scope as soon as that method returns. Without a strong block
@@ -646,8 +792,9 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
 
 - (NSString*)tableView:(UITableView*)t titleForFooterInSection:(NSInteger)s
 {
-    return @"点「重装」可清除该应用的状态并重新下载安装（手动删除后想恢复时用）。\n"
-           @"右上「重跑」会按当前状态跑一遍：跳过已装的、补装待装的、重试失败的。";
+    return @"🗑 表示 helper 记得装过但设备上已经没了（多半是你手动删的）。\n"
+           @"点「重装」清除该应用的状态并重新下载安装。\n"
+           @"右上「重跑」会按当前状态跑一遍：跳过设备上还在的、补装待装/被删的、重试失败的。";
 }
 
 - (UITableViewCell*)tableView:(UITableView*)t cellForRowAtIndexPath:(NSIndexPath*)ip
@@ -662,16 +809,33 @@ static NSString* const kMXStateFile = @"/var/mobile/Library/Preferences/com.opa3
     NSString* url = app[@"URL"];
     NSString* name = [app[@"Name"] isKindOfClass:NSString.class] ? app[@"Name"] : url.lastPathComponent;
 
-    NSDictionary* installed = self.state[@"installed_apps"];
-    BOOL isInstalled = [installed isKindOfClass:NSDictionary.class] && [installed[url] boolValue];
-    NSDictionary* errors = self.state[@"app_errors"];
-    NSString* err = [errors isKindOfClass:NSDictionary.class] ? errors[url] : nil;
+    NSDictionary* installed   = self.state[@"installed_apps"];
+    BOOL stateThinksInstalled = [installed isKindOfClass:NSDictionary.class] && [installed[url] boolValue];
+    NSDictionary* errors      = self.state[@"app_errors"];
+    NSString* err             = [errors isKindOfClass:NSDictionary.class] ? errors[url] : nil;
     if (![err isKindOfClass:NSString.class]) err = nil;
+    NSDictionary* bids        = self.state[@"app_bundle_ids"];
+    NSString* knownBid        = ([bids isKindOfClass:NSDictionary.class] && [bids[url] isKindOfClass:NSString.class])
+                                ? bids[url] : nil;
+
+    // Three-way installed check: trust state UNLESS we have a stored bid and
+    // the device doesn't currently have it (= user manually deleted).
+    BOOL deletedOnDevice = NO;
+    if (stateThinksInstalled && knownBid.length) {
+        if (![self.installedBidSet containsObject:knownBid]) {
+            deletedOnDevice = YES;
+        }
+    }
 
     cell.textLabel.text = name;
     cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
-    if (isInstalled) {
-        cell.detailTextLabel.text = @"✅ 已安装";
+    if (deletedOnDevice) {
+        cell.detailTextLabel.text = @"🗑 已被手动删除 (点重装恢复)";
+        cell.detailTextLabel.textColor = UIColor.systemOrangeColor;
+    } else if (stateThinksInstalled) {
+        cell.detailTextLabel.text = knownBid.length
+            ? @"✅ 已安装"
+            : @"✅ 已安装 (无法核对设备状态)";
         cell.detailTextLabel.textColor = UIColor.systemGreenColor;
     } else if (err.length) {
         cell.detailTextLabel.text = [NSString stringWithFormat:@"❌ 失败: %@", err];
