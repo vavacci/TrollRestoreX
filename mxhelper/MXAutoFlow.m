@@ -4,17 +4,9 @@
 #import <CommonCrypto/CommonDigest.h>
 #import <mach-o/getsect.h>
 
-// Forward-declared private API. TrollStore-context binaries have the
-// entitlements to call this — that's how trollstorehelper enumerates apps too.
-@interface LSApplicationProxy : NSObject
-@property (nonatomic, readonly) NSString* applicationIdentifier;
-@property (nonatomic, readonly) NSString* localizedName;
-@end
-
-@interface LSApplicationWorkspace : NSObject
-+ (instancetype)defaultWorkspace;
-- (NSArray<LSApplicationProxy*>*)allInstalledApplications;
-@end
+// LSApplicationProxy / LSApplicationWorkspace come in transitively via TSUtil
+// (TrollStore already uses them) — don't redeclare here or we get
+// "duplicate interface definition".
 
 @interface MXStatusVC : UIViewController <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, copy)   NSArray<NSDictionary*>* apps;
